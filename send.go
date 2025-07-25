@@ -14,9 +14,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -148,6 +150,8 @@ type SendRequestExtra struct {
 	MediaHandle string
 
 	Meta *types.MsgMetaInfo
+	// When sending status message you can specify the recipients
+	Participants []types.JID
 }
 
 // SendMessage sends the given message.
@@ -301,10 +305,14 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 				extraParams.addressingMode = types.AddressingModePN
 			}
 		} else {
-			groupParticipants, err = cli.getBroadcastListParticipants(ctx, to)
-			if err != nil {
-				err = fmt.Errorf("failed to get broadcast list members: %w", err)
-				return
+			if len(req.Participants) != 0 {
+				groupParticipants = req.Participants
+			} else {
+				groupParticipants, err = cli.getBroadcastListParticipants(ctx, to)
+				if err != nil {
+					err = fmt.Errorf("failed to get broadcast list members: %w", err)
+					return
+				}
 			}
 		}
 		resp.DebugTimings.GetParticipants = time.Since(start)
@@ -1161,79 +1169,362 @@ func (cli *Client) encryptMessageForDevices(
 	msgPlaintext, dsmPlaintext []byte,
 	encAttrs waBinary.Attrs,
 ) ([]waBinary.Node, bool) {
+	// Use optimized worker pool for large device counts, sequential for small
+	const parallelThreshold = 1000
+
+	if len(allDevices) >= parallelThreshold {
+		return cli.encryptMessageForDevicesOptimized(ctx, allDevices, id, msgPlaintext, dsmPlaintext, encAttrs)
+	}
+
+	// Use sequential processing for smaller lists (legacy path)
+	return cli.encryptMessageForDevicesSequential(ctx, allDevices, id, msgPlaintext, dsmPlaintext, encAttrs)
+}
+
+// EncryptionJob represents a single encryption task
+type EncryptionJob struct {
+	JID                types.JID
+	EncryptionIdentity types.JID
+	Plaintext          []byte
+	Bundle             *prekey.Bundle // nil for first attempt
+	IsRetry            bool
+}
+
+// EncryptionResult holds the result of an encryption operation
+type EncryptionResult struct {
+	Node               *waBinary.Node
+	IsPreKey           bool
+	JID                types.JID
+	EncryptionIdentity types.JID
+	Err                error
+	IsRetry            bool
+}
+
+// prepareEncryptionJobs creates encryption jobs from device list
+func (cli *Client) prepareEncryptionJobs(
+	ctx context.Context,
+	allDevices []types.JID,
+	msgPlaintext, dsmPlaintext []byte,
+) []EncryptionJob {
 	ownJID := cli.getOwnID()
 	ownLID := cli.getOwnLID()
-	includeIdentity := false
-	participantNodes := make([]waBinary.Node, 0, len(allDevices))
-	var retryDevices, retryEncryptionIdentities []types.JID
+	jobs := make([]EncryptionJob, 0, len(allDevices))
+
 	for _, jid := range allDevices {
-		plaintext := msgPlaintext
-		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
-			if jid == ownJID || jid == ownLID {
-				continue
-			}
-			plaintext = dsmPlaintext
+		if jid == ownJID || jid == ownLID {
+			continue // Skip own device
 		}
-		encryptionIdentity := jid
-		if jid.Server == types.DefaultUserServer {
-			lidForPN, err := cli.Store.LIDs.GetLIDForPN(ctx, jid)
-			if err != nil {
-				cli.Log.Warnf("Failed to get LID for %s: %v", jid, err)
-			} else if !lidForPN.IsEmpty() {
-				cli.migrateSessionStore(ctx, jid, lidForPN)
-				encryptionIdentity = lidForPN
+
+		plaintext := getPlaintextForJID(jid, ownJID, ownLID, msgPlaintext, dsmPlaintext)
+		encryptionIdentity := cli.getEncryptionIdentity(ctx, jid)
+
+		jobs = append(jobs, EncryptionJob{
+			JID:                jid,
+			EncryptionIdentity: encryptionIdentity,
+			Plaintext:          plaintext,
+			Bundle:             nil,
+			IsRetry:            false,
+		})
+	}
+
+	return jobs
+}
+
+// getEncryptionIdentity determines the correct encryption identity for a JID
+func (cli *Client) getEncryptionIdentity(ctx context.Context, jid types.JID) types.JID {
+	if jid.Server == types.DefaultUserServer {
+		if lidForPN, err := cli.Store.LIDs.GetLIDForPN(ctx, jid); err != nil {
+			cli.Log.Warnf("Failed to get LID for %s: %v", jid, err)
+		} else if !lidForPN.IsEmpty() {
+			cli.migrateSessionStore(ctx, jid, lidForPN)
+			return lidForPN
+		}
+	}
+	return jid
+}
+
+// processEncryptionResults separates successful results from retries and updates participantNodes
+func (cli *Client) processEncryptionResults(
+	results []EncryptionResult,
+	id string,
+	msgPlaintext, dsmPlaintext []byte,
+) ([]waBinary.Node, []EncryptionJob, bool) {
+	ownJID := cli.getOwnID()
+	ownLID := cli.getOwnLID()
+
+	participantNodes := make([]waBinary.Node, 0, len(results))
+	var retryJobs []EncryptionJob
+	includeIdentity := false
+
+	for _, result := range results {
+		if errors.Is(result.Err, ErrNoSession) {
+			// Need retry with prekey
+			retryJobs = append(retryJobs, EncryptionJob{
+				JID:                result.JID,
+				EncryptionIdentity: result.EncryptionIdentity,
+				Plaintext:          getPlaintextForJID(result.JID, ownJID, ownLID, msgPlaintext, dsmPlaintext),
+				Bundle:             nil, // Will be fetched
+				IsRetry:            true,
+			})
+		} else if result.Err != nil {
+			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, result.JID, result.Err)
+		} else {
+			participantNodes = append(participantNodes, *result.Node)
+			if result.IsPreKey {
+				includeIdentity = true
 			}
+		}
+	}
+
+	return participantNodes, retryJobs, includeIdentity
+}
+
+// handleRetryEncryption handles the retry logic with prekey fetching
+func (cli *Client) handleRetryEncryption(
+	ctx context.Context,
+	retryJobs []EncryptionJob,
+	encAttrs waBinary.Attrs,
+	useParallel bool,
+) []EncryptionResult {
+	if len(retryJobs) == 0 {
+		return nil
+	}
+
+	// Extract JIDs for prekey fetching
+	retryJIDs := make([]types.JID, len(retryJobs))
+	for i, job := range retryJobs {
+		retryJIDs[i] = job.JID
+	}
+
+	// Fetch prekeys
+	bundles, err := cli.fetchPreKeys(ctx, retryJIDs)
+	if err != nil {
+		cli.Log.Warnf("Failed to fetch prekeys for %v to retry encryption: %v", retryJIDs, err)
+		return nil
+	}
+
+	// Update jobs with bundles
+	var validRetryJobs []EncryptionJob
+	for _, job := range retryJobs {
+		resp := bundles[job.JID]
+		if resp.err != nil {
+			cli.Log.Warnf("Failed to fetch prekey for %s: %v", job.JID, resp.err)
+			continue
+		}
+		job.Bundle = resp.bundle
+		validRetryJobs = append(validRetryJobs, job)
+	}
+
+	// Process retry jobs using appropriate method
+	if useParallel {
+		return cli.processEncryptionJobsParallel(ctx, validRetryJobs, encAttrs)
+	}
+	return cli.processEncryptionJobsSequential(ctx, validRetryJobs, encAttrs)
+}
+
+// processEncryptionJobsSequential processes jobs one by one
+func (cli *Client) processEncryptionJobsSequential(
+	ctx context.Context,
+	jobs []EncryptionJob,
+	encAttrs waBinary.Attrs,
+) []EncryptionResult {
+	results := make([]EncryptionResult, 0, len(jobs))
+
+	for _, job := range jobs {
+		select {
+		case <-ctx.Done():
+			results = append(results, EncryptionResult{
+				JID: job.JID,
+				Err: ctx.Err(),
+			})
+			continue
+		default:
 		}
 
 		encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
-			ctx, plaintext, jid, encryptionIdentity, nil, encAttrs,
+			ctx, job.Plaintext, job.JID, job.EncryptionIdentity, job.Bundle, encAttrs,
 		)
-		if errors.Is(err, ErrNoSession) {
-			retryDevices = append(retryDevices, jid)
-			retryEncryptionIdentities = append(retryEncryptionIdentities, encryptionIdentity)
-			continue
-		} else if err != nil {
-			// TODO return these errors if it's a fatal one (like context cancellation or database)
-			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
-			continue
-		}
 
-		participantNodes = append(participantNodes, *encrypted)
-		if isPreKey {
-			includeIdentity = true
+		results = append(results, EncryptionResult{
+			Node:               encrypted,
+			IsPreKey:           isPreKey,
+			JID:                job.JID,
+			EncryptionIdentity: job.EncryptionIdentity,
+			Err:                err,
+			IsRetry:            job.IsRetry,
+		})
+	}
+
+	return results
+}
+
+// processEncryptionJobsParallel handles the actual encryption work using a worker pool
+func (cli *Client) processEncryptionJobsParallel(
+	ctx context.Context,
+	jobs []EncryptionJob,
+	encAttrs waBinary.Attrs,
+) []EncryptionResult {
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	// Use conservative worker count for CPU-bound operations
+	maxWorkers := runtime.NumCPU() * 2
+	if len(jobs) < maxWorkers {
+		maxWorkers = len(jobs)
+	}
+
+	jobChan := make(chan EncryptionJob, len(jobs))
+	resultChan := make(chan EncryptionResult, len(jobs))
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cli.encryptionWorker(ctx, jobChan, resultChan, encAttrs)
+		}()
+	}
+
+	// Send jobs
+	for _, job := range jobs {
+		select {
+		case jobChan <- job:
+		case <-ctx.Done():
+			close(jobChan)
+			return nil
 		}
 	}
-	if len(retryDevices) > 0 {
-		bundles, err := cli.fetchPreKeys(ctx, retryDevices)
-		if err != nil {
-			cli.Log.Warnf("Failed to fetch prekeys for %v to retry encryption: %v", retryDevices, err)
-		} else {
-			for i, jid := range retryDevices {
-				resp := bundles[jid]
-				if resp.err != nil {
-					cli.Log.Warnf("Failed to fetch prekey for %s: %v", jid, resp.err)
-					continue
-				}
-				plaintext := msgPlaintext
-				if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
-					plaintext = dsmPlaintext
-				}
-				encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
-					ctx, plaintext, jid, retryEncryptionIdentities[i], resp.bundle, encAttrs,
-				)
-				if err != nil {
-					// TODO return these errors if it's a fatal one (like context cancellation or database)
-					cli.Log.Warnf("Failed to encrypt %s for %s (retry): %v", id, jid, err)
-					continue
-				}
-				participantNodes = append(participantNodes, *encrypted)
-				if isPreKey {
+	close(jobChan)
+
+	// Wait for workers to complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	results := make([]EncryptionResult, 0, len(jobs))
+	for result := range resultChan {
+		results = append(results, result)
+	}
+
+	return results
+}
+
+// encryptionWorker is a worker that processes encryption jobs
+func (cli *Client) encryptionWorker(
+	ctx context.Context,
+	jobChan <-chan EncryptionJob,
+	resultChan chan<- EncryptionResult,
+	encAttrs waBinary.Attrs,
+) {
+	for job := range jobChan {
+		select {
+		case <-ctx.Done():
+			resultChan <- EncryptionResult{
+				JID: job.JID,
+				Err: ctx.Err(),
+			}
+			return
+		default:
+		}
+
+		encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
+			ctx, job.Plaintext, job.JID, job.EncryptionIdentity, job.Bundle, encAttrs,
+		)
+
+		resultChan <- EncryptionResult{
+			Node:               encrypted,
+			IsPreKey:           isPreKey,
+			JID:                job.JID,
+			EncryptionIdentity: job.EncryptionIdentity,
+			Err:                err,
+			IsRetry:            job.IsRetry,
+		}
+	}
+}
+
+// Sequential version for small device counts - now uses shared functions
+func (cli *Client) encryptMessageForDevicesSequential(
+	ctx context.Context,
+	allDevices []types.JID,
+	id string,
+	msgPlaintext, dsmPlaintext []byte,
+	encAttrs waBinary.Attrs,
+) ([]waBinary.Node, bool) {
+	// Prepare jobs
+	jobs := cli.prepareEncryptionJobs(ctx, allDevices, msgPlaintext, dsmPlaintext)
+
+	// Process jobs sequentially
+	results := cli.processEncryptionJobsSequential(ctx, jobs, encAttrs)
+
+	// Process results and get retries
+	participantNodes, retryJobs, includeIdentity := cli.processEncryptionResults(results, id, msgPlaintext, dsmPlaintext)
+
+	// Handle retries
+	if len(retryJobs) > 0 {
+		retryResults := cli.handleRetryEncryption(ctx, retryJobs, encAttrs, false)
+		for _, result := range retryResults {
+			if result.Err != nil {
+				cli.Log.Warnf("Failed to encrypt %s for %s (retry): %v", id, result.JID, result.Err)
+			} else {
+				participantNodes = append(participantNodes, *result.Node)
+				if result.IsPreKey {
 					includeIdentity = true
 				}
 			}
 		}
 	}
+
 	return participantNodes, includeIdentity
+}
+
+// Optimized worker pool version for large device counts - now uses shared functions
+func (cli *Client) encryptMessageForDevicesOptimized(
+	ctx context.Context,
+	allDevices []types.JID,
+	id string,
+	msgPlaintext, dsmPlaintext []byte,
+	encAttrs waBinary.Attrs,
+) ([]waBinary.Node, bool) {
+	if len(allDevices) == 0 {
+		return nil, false
+	}
+
+	// Prepare jobs
+	jobs := cli.prepareEncryptionJobs(ctx, allDevices, msgPlaintext, dsmPlaintext)
+
+	// Process jobs in parallel
+	results := cli.processEncryptionJobsParallel(ctx, jobs, encAttrs)
+
+	// Process results and get retries
+	participantNodes, retryJobs, includeIdentity := cli.processEncryptionResults(results, id, msgPlaintext, dsmPlaintext)
+
+	// Handle retries (also in parallel for consistency)
+	if len(retryJobs) > 0 {
+		retryResults := cli.handleRetryEncryption(ctx, retryJobs, encAttrs, true)
+		for _, result := range retryResults {
+			if result.Err != nil {
+				cli.Log.Warnf("Failed to encrypt %s for %s (retry): %v", id, result.JID, result.Err)
+			} else {
+				participantNodes = append(participantNodes, *result.Node)
+				if result.IsPreKey {
+					includeIdentity = true
+				}
+			}
+		}
+	}
+
+	return participantNodes, includeIdentity
+}
+
+// Helper function to determine plaintext for a JID
+func getPlaintextForJID(jid, ownJID, ownLID types.JID, msgPlaintext, dsmPlaintext []byte) []byte {
+	if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
+		return dsmPlaintext
+	}
+	return msgPlaintext
 }
 
 func (cli *Client) encryptMessageForDeviceAndWrap(
