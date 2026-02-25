@@ -467,33 +467,21 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 		}
 	}
 	if len(jidsToSync) > 0 {
-		// Batch usync queries in chunks of 5000 to avoid triggering WhatsApp's
-		// anti-enumeration detection. Large single queries (8K+) have caused
-		// account bans (403 logout) on sensitive devices.
-		const usyncBatchSize = 5000
-		for i := 0; i < len(jidsToSync); i += usyncBatchSize {
-			end := i + usyncBatchSize
-			if end > len(jidsToSync) {
-				end = len(jidsToSync)
-			}
-			batch := jidsToSync[i:end]
+		list, err := cli.usync(ctx, jidsToSync, "query", "message", []waBinary.Node{
+			{Tag: "devices", Attrs: waBinary.Attrs{"version": "2"}},
+		})
+		if err != nil {
+			return nil, err
+		}
 
-			list, err := cli.usync(ctx, batch, "query", "message", []waBinary.Node{
-				{Tag: "devices", Attrs: waBinary.Attrs{"version": "2"}},
-			})
-			if err != nil {
-				return nil, err
+		for _, user := range list.GetChildren() {
+			jid, jidOK := user.Attrs["jid"].(types.JID)
+			if user.Tag != "user" || !jidOK {
+				continue
 			}
-
-			for _, user := range list.GetChildren() {
-				jid, jidOK := user.Attrs["jid"].(types.JID)
-				if user.Tag != "user" || !jidOK {
-					continue
-				}
-				userDevices := parseDeviceList(jid, user.GetChildByTag("devices"))
-				cli.userDevicesCache[jid] = deviceCache{devices: userDevices, dhash: participantListHashV2(userDevices)}
-				devices = append(devices, userDevices...)
-			}
+			userDevices := parseDeviceList(jid, user.GetChildByTag("devices"))
+			cli.userDevicesCache[jid] = deviceCache{devices: userDevices, dhash: participantListHashV2(userDevices)}
+			devices = append(devices, userDevices...)
 		}
 	}
 
