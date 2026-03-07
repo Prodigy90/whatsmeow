@@ -147,6 +147,9 @@ type Client struct {
 	// Note: in DMs, the "to" field may be different from what you originally sent to (LID vs phone number),
 	// make sure to check both if necessary.
 	GetMessageForRetry func(requester, to types.JID, id types.MessageID) *waE2E.Message
+	// OnMessageSent is called whenever a message is added to the recent messages cache (i.e. after sending).
+	// This can be used to persist sent messages for retry receipt handling across restarts.
+	OnMessageSent func(to types.JID, id types.MessageID, msg *waE2E.Message)
 	// PreRetryCallback is called before a retry receipt is accepted.
 	// If it returns false, the accepting will be cancelled and the retry receipt will be ignored.
 	PreRetryCallback func(receipt *events.Receipt, id types.MessageID, retryCount int, msg *waE2E.Message) bool

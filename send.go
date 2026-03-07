@@ -1299,7 +1299,7 @@ func (cli *Client) encryptMessageForDevices(
 	}
 	identityPrefetchDur := time.Since(identityPrefetchStart)
 
-	cli.Log.Infof("Cache prefetch: %d addresses, sessions=%s, identities=%s", len(sessionAddresses), sessionPrefetchDur, identityPrefetchDur)
+	cli.Log.Debugf("Cache prefetch: %d addresses, sessions=%s, identities=%s", len(sessionAddresses), sessionPrefetchDur, identityPrefetchDur)
 
 	var retryDevices []types.JID
 	for addr, exists := range existingSessions {
@@ -1336,7 +1336,7 @@ func (cli *Client) encryptMessageForDevices(
 	sem := make(chan struct{}, workers)
 	results := make([]encResult, len(allDevices))
 
-	cli.Log.Infof("Encrypting for %d devices (%d need prekey bundles), workers=%d", len(allDevices), len(retryDevices), workers)
+	cli.Log.Debugf("Encrypting for %d devices (%d need prekey bundles), workers=%d", len(allDevices), len(retryDevices), workers)
 	encryptStart := time.Now()
 	var wg sync.WaitGroup
 	for i, jid := range allDevices {
@@ -1399,7 +1399,7 @@ func (cli *Client) encryptMessageForDevices(
 			failCount++
 		}
 	}
-	cli.Log.Infof("Encryption done: %d devices, encrypt=%s, flush=%s, failed=%d, prekey=%v",
+	cli.Log.Debugf("Encryption done: %d devices, encrypt=%s, flush=%s, failed=%d, prekey=%v",
 		len(allDevices), encryptDur, flushDur, failCount, includeIdentity)
 
 	return participantNodes, includeIdentity, nil

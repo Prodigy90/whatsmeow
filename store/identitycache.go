@@ -102,7 +102,7 @@ func (device *Device) WithCachedIdentities(ctx context.Context, addresses []stri
 		}
 	}
 
-	device.Log.Infof("Identity cache prefetch: %d found, %d not-found (TOFU), %d total", found, notFound, len(addresses))
+	device.Log.Debugf("Identity cache prefetch: %d found, %d not-found (TOFU), %d total", found, notFound, len(addresses))
 
 	ctx = context.WithValue(ctx, contextKeyIdentityCache, (*identityCache)(exsync.NewMapWithData(wrapped)))
 	return ctx, nil
@@ -120,7 +120,7 @@ func (device *Device) PutCachedIdentities(ctx context.Context) error {
 		}
 	}
 	if len(dirtyIdentities) > 0 {
-		device.Log.Infof("Identity cache flush: %d dirty entries to write", len(dirtyIdentities))
+		device.Log.Debugf("Identity cache flush: %d dirty entries to write", len(dirtyIdentities))
 		err := device.Identities.PutManyIdentities(ctx, dirtyIdentities)
 		if err != nil {
 			return fmt.Errorf("failed to store cached identities: %w", err)

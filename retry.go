@@ -60,6 +60,9 @@ func (cli *Client) addRecentMessage(to types.JID, id types.MessageID, wa *waE2E.
 		cli.recentMessagesPtr = 0
 	}
 	cli.recentMessagesLock.Unlock()
+	if wa != nil && cli.OnMessageSent != nil {
+		cli.OnMessageSent(to, id, wa)
+	}
 }
 
 func (cli *Client) getRecentMessage(to types.JID, id types.MessageID) RecentMessage {
