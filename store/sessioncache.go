@@ -56,6 +56,14 @@ func getCachedSession(ctx context.Context, addr string) *record.Session {
 	return sess.Record
 }
 
+func evictCachedSession(ctx context.Context, addr string) {
+	cache := getSessionCache(ctx)
+	if cache == nil {
+		return
+	}
+	cache.Delete(addr)
+}
+
 func putCachedSession(ctx context.Context, addr string, record *record.Session) bool {
 	cache := getSessionCache(ctx)
 	if cache == nil {
@@ -67,6 +75,10 @@ func putCachedSession(ctx context.Context, addr string, record *record.Session) 
 		Record: record,
 	})
 	return true
+}
+
+func (device *Device) EvictCachedSession(ctx context.Context, addr string) {
+	evictCachedSession(ctx, addr)
 }
 
 func (device *Device) WithCachedSessions(ctx context.Context, addresses []string) (map[string]bool, context.Context, error) {

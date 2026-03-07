@@ -14,10 +14,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -1283,10 +1285,22 @@ func (cli *Client) encryptMessageForDevices(
 		sessionAddressToJID[addr] = jid
 	}
 
+	prefetchStart := time.Now()
 	existingSessions, ctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to prefetch sessions: %w", err)
 	}
+	sessionPrefetchDur := time.Since(prefetchStart)
+
+	identityPrefetchStart := time.Now()
+	ctx, err = cli.Store.WithCachedIdentities(ctx, sessionAddresses)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to prefetch identities: %w", err)
+	}
+	identityPrefetchDur := time.Since(identityPrefetchStart)
+
+	cli.Log.Infof("Cache prefetch: %d addresses, sessions=%s, identities=%s", len(sessionAddresses), sessionPrefetchDur, identityPrefetchDur)
+
 	var retryDevices []types.JID
 	for addr, exists := range existingSessions {
 		if !exists {
@@ -1295,35 +1309,99 @@ func (cli *Client) encryptMessageForDevices(
 	}
 	bundles := cli.fetchPreKeysNoError(ctx, retryDevices)
 
-	for _, jid := range allDevices {
-		plaintext := msgPlaintext
+	type encResult struct {
+		node     *waBinary.Node
+		isPreKey bool
+		skip     bool
+		err      error
+	}
+
+	// Pre-compute plaintexts and mark skipped devices
+	plaintexts := make([][]byte, len(allDevices))
+	for i, jid := range allDevices {
 		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
 			if jid == ownJID || jid == ownLID {
 				continue
 			}
-			plaintext = dsmPlaintext
+			plaintexts[i] = dsmPlaintext
+		} else {
+			plaintexts[i] = msgPlaintext
 		}
-		encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
-			ctx, plaintext, jid, encryptionIdentities[jid], bundles[jid], encAttrs, existingSessions,
-		)
-		if err != nil {
-			// TODO return these errors if it's a fatal one (like context cancellation or database)
-			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
+	}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 16 {
+		workers = 16
+	}
+	sem := make(chan struct{}, workers)
+	results := make([]encResult, len(allDevices))
+
+	cli.Log.Infof("Encrypting for %d devices (%d need prekey bundles), workers=%d", len(allDevices), len(retryDevices), workers)
+	encryptStart := time.Now()
+	var wg sync.WaitGroup
+	for i, jid := range allDevices {
+		if plaintexts[i] == nil {
+			results[i] = encResult{skip: true}
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, j types.JID, pt []byte) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					results[idx] = encResult{err: fmt.Errorf("panic encrypting for %s: %v", j, r)}
+				}
+			}()
+			encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
+				ctx, pt, j, encryptionIdentities[j], bundles[j], encAttrs, existingSessions,
+			)
+			results[idx] = encResult{node: encrypted, isPreKey: isPreKey, err: err}
+		}(i, jid, plaintexts[i])
+	}
+	wg.Wait()
+
+	for i, r := range results {
+		if r.skip {
+			continue
+		}
+		if r.err != nil {
+			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, allDevices[i], r.err)
 			if ctx.Err() != nil {
-				return nil, false, err
+				return nil, false, r.err
 			}
 			continue
 		}
-
-		participantNodes = append(participantNodes, *encrypted)
-		if isPreKey {
-			includeIdentity = true
+		if r.node != nil {
+			participantNodes = append(participantNodes, *r.node)
+			if r.isPreKey {
+				includeIdentity = true
+			}
 		}
 	}
+	encryptDur := time.Since(encryptStart)
+
+	flushStart := time.Now()
 	err = cli.Store.PutCachedSessions(ctx)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to save cached sessions: %w", err)
 	}
+	err = cli.Store.PutCachedIdentities(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to save cached identities: %w", err)
+	}
+	flushDur := time.Since(flushStart)
+
+	var failCount int
+	for _, r := range results {
+		if !r.skip && r.err != nil {
+			failCount++
+		}
+	}
+	cli.Log.Infof("Encryption done: %d devices, encrypt=%s, flush=%s, failed=%d, prekey=%v",
+		len(allDevices), encryptDur, flushDur, failCount, includeIdentity)
+
 	return participantNodes, includeIdentity, nil
 }
 

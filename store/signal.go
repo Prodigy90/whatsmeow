@@ -36,7 +36,11 @@ func (device *Device) GetLocalRegistrationID() uint32 {
 
 func (device *Device) SaveIdentity(ctx context.Context, address *protocol.SignalAddress, identityKey *identity.Key) error {
 	addrString := address.String()
-	err := device.Identities.PutIdentity(ctx, addrString, identityKey.PublicKey().PublicKey())
+	pubKey := identityKey.PublicKey().PublicKey()
+	if putCachedIdentity(ctx, addrString, pubKey) {
+		return nil
+	}
+	err := device.Identities.PutIdentity(ctx, addrString, pubKey)
 	if err != nil {
 		return fmt.Errorf("failed to save identity of %s: %w", addrString, err)
 	}
@@ -45,7 +49,14 @@ func (device *Device) SaveIdentity(ctx context.Context, address *protocol.Signal
 
 func (device *Device) IsTrustedIdentity(ctx context.Context, address *protocol.SignalAddress, identityKey *identity.Key) (bool, error) {
 	addrString := address.String()
-	isTrusted, err := device.Identities.IsTrustedIdentity(ctx, addrString, identityKey.PublicKey().PublicKey())
+	pubKey := identityKey.PublicKey().PublicKey()
+	if existingKey, inCache := getCachedIdentity(ctx, addrString); inCache {
+		if existingKey == nil {
+			return true, nil // TOFU: not known, trust on first use
+		}
+		return *existingKey == pubKey, nil
+	}
+	isTrusted, err := device.Identities.IsTrustedIdentity(ctx, addrString, pubKey)
 	if err != nil {
 		return false, fmt.Errorf("failed to check if %s's identity is trusted: %w", addrString, err)
 	}

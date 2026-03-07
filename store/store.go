@@ -21,6 +21,8 @@ import (
 
 type IdentityStore interface {
 	PutIdentity(ctx context.Context, address string, key [32]byte) error
+	GetManyIdentities(ctx context.Context, addresses []string) (map[string]*[32]byte, error)
+	PutManyIdentities(ctx context.Context, identities map[string][32]byte) error
 	DeleteAllIdentities(ctx context.Context, phone string) error
 	DeleteIdentity(ctx context.Context, address string) error
 	IsTrustedIdentity(ctx context.Context, address string, key [32]byte) (bool, error)

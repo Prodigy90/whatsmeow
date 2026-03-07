@@ -48,6 +48,14 @@ func (n *NoopStore) PutIdentity(ctx context.Context, address string, key [32]byt
 	return n.Error
 }
 
+func (n *NoopStore) GetManyIdentities(ctx context.Context, addresses []string) (map[string]*[32]byte, error) {
+	return nil, n.Error
+}
+
+func (n *NoopStore) PutManyIdentities(ctx context.Context, identities map[string][32]byte) error {
+	return n.Error
+}
+
 func (n *NoopStore) DeleteAllIdentities(ctx context.Context, phone string) error {
 	return n.Error
 }

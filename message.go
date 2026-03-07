@@ -470,14 +470,17 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 }
 
 func (cli *Client) clearUntrustedIdentity(ctx context.Context, target types.JID) error {
-	err := cli.Store.Identities.DeleteIdentity(ctx, target.SignalAddress().String())
+	addr := target.SignalAddress().String()
+	err := cli.Store.Identities.DeleteIdentity(ctx, addr)
 	if err != nil {
 		return fmt.Errorf("failed to delete identity: %w", err)
 	}
-	err = cli.Store.Sessions.DeleteSession(ctx, target.SignalAddress().String())
+	cli.Store.EvictCachedIdentity(ctx, addr)
+	err = cli.Store.Sessions.DeleteSession(ctx, addr)
 	if err != nil {
 		return fmt.Errorf("failed to delete session: %w", err)
 	}
+	cli.Store.EvictCachedSession(ctx, addr)
 	go cli.dispatchEvent(&events.IdentityChange{JID: target, Timestamp: time.Now(), Implicit: true})
 	return nil
 }
