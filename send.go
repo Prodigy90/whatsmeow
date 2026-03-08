@@ -1270,12 +1270,14 @@ func (cli *Client) encryptMessageForDevices(
 	encryptionIdentities := make(map[types.JID]types.JID, len(allDevices))
 	sessionAddressToJID := make(map[string]types.JID, len(allDevices))
 	sessionAddresses := make([]string, 0, len(allDevices))
+	// Collect PN→LID mappings for batch migration
+	pnToLIDMappings := make(map[types.JID]types.JID)
 	for _, jid := range allDevices {
 		encryptionIdentity := jid
 		if jid.Server == types.DefaultUserServer {
 			// TODO query LID from server for missing entries
 			if lidForPN, ok := lidMappings[jid]; ok && !lidForPN.IsEmpty() {
-				cli.migrateSessionStore(ctx, jid, lidForPN)
+				pnToLIDMappings[jid] = lidForPN
 				encryptionIdentity = lidForPN
 			}
 		}
@@ -1283,6 +1285,14 @@ func (cli *Client) encryptMessageForDevices(
 		addr := encryptionIdentity.SignalAddress().String()
 		sessionAddresses = append(sessionAddresses, addr)
 		sessionAddressToJID[addr] = jid
+	}
+
+	// Batch migrate all PN→LID sessions/identities/sender keys (6 queries instead of 6*N)
+	if len(pnToLIDMappings) > 0 {
+		err = cli.Store.Sessions.MigrateManyPNsToLIDs(ctx, pnToLIDMappings)
+		if err != nil {
+			cli.Log.Errorf("Failed to batch migrate signal store PN→LID: %v", err)
+		}
 	}
 
 	prefetchStart := time.Now()

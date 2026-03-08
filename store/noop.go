@@ -100,6 +100,10 @@ func (n *NoopStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error
 	return n.Error
 }
 
+func (n *NoopStore) MigrateManyPNsToLIDs(ctx context.Context, mappings map[types.JID]types.JID) error {
+	return n.Error
+}
+
 func (n *NoopStore) GetOrGenPreKeys(ctx context.Context, count uint32) ([]*keys.PreKey, error) {
 	return nil, n.Error
 }

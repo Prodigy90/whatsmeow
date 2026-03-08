@@ -91,6 +91,18 @@ type addressIdentityTuple struct {
 	Identity []byte
 }
 
+// identityEntry is used for batched mass inserts of identity keys.
+type identityEntry struct {
+	Address  string
+	Identity []byte
+}
+
+func (ie identityEntry) GetMassInsertValues() [2]any {
+	return [2]any{ie.Address, ie.Identity}
+}
+
+var putIdentitiesMassInsertBuilder = dbutil.NewMassInsertBuilder[identityEntry, [1]any](putIdentityQuery, "($1, $%d, $%d)")
+
 var identityScanner = dbutil.ConvertRowFn[addressIdentityTuple](func(row dbutil.Scannable) (out addressIdentityTuple, err error) {
 	err = row.Scan(&out.Address, &out.Identity)
 	return
@@ -132,10 +144,20 @@ func (s *SQLStore) GetManyIdentities(ctx context.Context, addresses []string) (m
 	return result, nil
 }
 
+const identityBatchSize = 500
+
 func (s *SQLStore) PutManyIdentities(ctx context.Context, identities map[string][32]byte) error {
+	if len(identities) == 0 {
+		return nil
+	}
+	entries := make([]identityEntry, 0, len(identities))
+	for addr, key := range identities {
+		entries = append(entries, identityEntry{Address: addr, Identity: key[:]})
+	}
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		for addr, key := range identities {
-			err := s.PutIdentity(ctx, addr, key)
+		for slice := range slices.Chunk(entries, identityBatchSize) {
+			query, vars := putIdentitiesMassInsertBuilder.Build([1]any{s.JID}, slice)
+			_, err := s.db.Exec(ctx, query, vars...)
 			if err != nil {
 				return err
 			}
@@ -226,6 +248,18 @@ type addressSessionTuple struct {
 	Session []byte
 }
 
+// sessionEntry is used for batched mass inserts of sessions.
+type sessionEntry struct {
+	Address string
+	Session []byte
+}
+
+func (se sessionEntry) GetMassInsertValues() [2]any {
+	return [2]any{se.Address, se.Session}
+}
+
+var putSessionsMassInsertBuilder = dbutil.NewMassInsertBuilder[sessionEntry, [1]any](putSessionQuery, "($1, $%d, $%d)")
+
 var sessionScanner = dbutil.ConvertRowFn[addressSessionTuple](func(row dbutil.Scannable) (out addressSessionTuple, err error) {
 	err = row.Scan(&out.Address, &out.Session)
 	return
@@ -264,10 +298,20 @@ func (s *SQLStore) GetManySessions(ctx context.Context, addresses []string) (map
 	return result, nil
 }
 
+const sessionBatchSize = 500
+
 func (s *SQLStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
+	if len(sessions) == 0 {
+		return nil
+	}
+	entries := make([]sessionEntry, 0, len(sessions))
+	for addr, sess := range sessions {
+		entries = append(entries, sessionEntry{Address: addr, Session: sess})
+	}
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		for addr, sess := range sessions {
-			err := s.PutSession(ctx, addr, sess)
+		for slice := range slices.Chunk(entries, sessionBatchSize) {
+			query, vars := putSessionsMassInsertBuilder.Build([1]any{s.JID}, slice)
+			_, err := s.db.Exec(ctx, query, vars...)
 			if err != nil {
 				return err
 			}
@@ -362,6 +406,142 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 		s.log.Debugf("No sessions or sender keys found to migrate from %s to %s", pnSignal, lidSignal)
 	}
 	return nil
+}
+
+const (
+	migrateManyPNsToLIDSessionsQuery = `
+		WITH pn_lid_map AS (
+			SELECT unnest($2::text[]) as pn, unnest($3::text[]) as lid
+		)
+		INSERT INTO whatsmeow_sessions (our_jid, their_id, session)
+		SELECT s.our_jid, replace(s.their_id, m.pn, m.lid), s.session
+		FROM whatsmeow_sessions s
+		JOIN pn_lid_map m ON split_part(s.their_id, ':', 1) = m.pn
+		WHERE s.our_jid = $1
+		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
+	`
+	deleteManyPNSessionsQuery = `
+		DELETE FROM whatsmeow_sessions s
+		USING unnest($2::text[]) AS pn
+		WHERE s.our_jid = $1 AND split_part(s.their_id, ':', 1) = pn
+	`
+	migrateManyPNsToLIDIdentityKeysQuery = `
+		WITH pn_lid_map AS (
+			SELECT unnest($2::text[]) as pn, unnest($3::text[]) as lid
+		)
+		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity)
+		SELECT s.our_jid, replace(s.their_id, m.pn, m.lid), s.identity
+		FROM whatsmeow_identity_keys s
+		JOIN pn_lid_map m ON split_part(s.their_id, ':', 1) = m.pn
+		WHERE s.our_jid = $1
+		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
+	`
+	deleteManyPNIdentityKeysQuery = `
+		DELETE FROM whatsmeow_identity_keys s
+		USING unnest($2::text[]) AS pn
+		WHERE s.our_jid = $1 AND split_part(s.their_id, ':', 1) = pn
+	`
+	migrateManyPNsToLIDSenderKeysQuery = `
+		WITH pn_lid_map AS (
+			SELECT unnest($2::text[]) as pn, unnest($3::text[]) as lid
+		)
+		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
+		SELECT s.our_jid, s.chat_id, replace(s.sender_id, m.pn, m.lid), s.sender_key
+		FROM whatsmeow_sender_keys s
+		JOIN pn_lid_map m ON split_part(s.sender_id, ':', 1) = m.pn
+		WHERE s.our_jid = $1
+		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
+	`
+	deleteManyPNSenderKeysQuery = `
+		DELETE FROM whatsmeow_sender_keys s
+		USING unnest($2::text[]) AS pn
+		WHERE s.our_jid = $1 AND split_part(s.sender_id, ':', 1) = pn
+	`
+)
+
+func (s *SQLStore) MigrateManyPNsToLIDs(ctx context.Context, mappings map[types.JID]types.JID) error {
+	if len(mappings) == 0 {
+		return nil
+	}
+
+	// Filter through in-memory cache — only migrate PNs we haven't seen yet
+	var pnSignals, lidSignals []string
+	for pn, lid := range mappings {
+		pnSignal := pn.SignalAddressUser()
+		if s.migratedPNSessionsCache.Add(pnSignal) {
+			pnSignals = append(pnSignals, pnSignal)
+			lidSignals = append(lidSignals, lid.SignalAddressUser())
+		}
+	}
+	if len(pnSignals) == 0 {
+		return nil
+	}
+
+	// Use Postgres UNNEST for batch migration (6 queries instead of 6*N)
+	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
+		return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+			pnArr := PostgresArrayWrapper(pnSignals)
+			lidArr := PostgresArrayWrapper(lidSignals)
+
+			_, err := s.db.Exec(ctx, migrateManyPNsToLIDSessionsQuery, s.JID, pnArr, lidArr)
+			if err != nil {
+				return fmt.Errorf("failed to batch migrate sessions: %w", err)
+			}
+			_, err = s.db.Exec(ctx, deleteManyPNSessionsQuery, s.JID, pnArr)
+			if err != nil {
+				return fmt.Errorf("failed to batch delete old PN sessions: %w", err)
+			}
+
+			_, err = s.db.Exec(ctx, migrateManyPNsToLIDIdentityKeysQuery, s.JID, pnArr, lidArr)
+			if err != nil {
+				return fmt.Errorf("failed to batch migrate identity keys: %w", err)
+			}
+			_, err = s.db.Exec(ctx, deleteManyPNIdentityKeysQuery, s.JID, pnArr)
+			if err != nil {
+				return fmt.Errorf("failed to batch delete old PN identity keys: %w", err)
+			}
+
+			_, err = s.db.Exec(ctx, migrateManyPNsToLIDSenderKeysQuery, s.JID, pnArr, lidArr)
+			if err != nil {
+				return fmt.Errorf("failed to batch migrate sender keys: %w", err)
+			}
+			_, err = s.db.Exec(ctx, deleteManyPNSenderKeysQuery, s.JID, pnArr)
+			if err != nil {
+				return fmt.Errorf("failed to batch delete old PN sender keys: %w", err)
+			}
+
+			return nil
+		})
+	}
+
+	// Non-Postgres fallback: individual migrations in a single transaction
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for i, pnSignal := range pnSignals {
+			lidSignal := lidSignals[i]
+			_, err := s.db.Exec(ctx, migratePNToLIDSessionsQuery, s.JID, pnSignal, lidSignal)
+			if err != nil {
+				return fmt.Errorf("failed to migrate sessions for %s: %w", pnSignal, err)
+			}
+			if err = s.deleteAllSessions(ctx, pnSignal); err != nil {
+				return fmt.Errorf("failed to delete sessions for %s: %w", pnSignal, err)
+			}
+			_, err = s.db.Exec(ctx, migratePNToLIDIdentityKeysQuery, s.JID, pnSignal, lidSignal)
+			if err != nil {
+				return fmt.Errorf("failed to migrate identity keys for %s: %w", pnSignal, err)
+			}
+			if err = s.deleteAllIdentityKeys(ctx, pnSignal); err != nil {
+				return fmt.Errorf("failed to delete identity keys for %s: %w", pnSignal, err)
+			}
+			_, err = s.db.Exec(ctx, migratePNToLIDSenderKeysQuery, s.JID, pnSignal, lidSignal)
+			if err != nil {
+				return fmt.Errorf("failed to migrate sender keys for %s: %w", pnSignal, err)
+			}
+			if err = s.deleteAllSenderKeys(ctx, pnSignal); err != nil {
+				return fmt.Errorf("failed to delete sender keys for %s: %w", pnSignal, err)
+			}
+		}
+		return nil
+	})
 }
 
 const (

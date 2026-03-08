@@ -37,6 +37,7 @@ type SessionStore interface {
 	DeleteAllSessions(ctx context.Context, phone string) error
 	DeleteSession(ctx context.Context, address string) error
 	MigratePNToLID(ctx context.Context, pn, lid types.JID) error
+	MigrateManyPNsToLIDs(ctx context.Context, mappings map[types.JID]types.JID) error
 }
 
 type PreKeyStore interface {
