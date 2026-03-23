@@ -147,12 +147,13 @@ type Client struct {
 	// Note: in DMs, the "to" field may be different from what you originally sent to (LID vs phone number),
 	// make sure to check both if necessary.
 	GetMessageForRetry func(requester, to types.JID, id types.MessageID) *waE2E.Message
-	// OnMessageSent is called whenever a message is added to the recent messages cache (i.e. after sending).
-	// This can be used to persist sent messages for retry receipt handling across restarts.
-	OnMessageSent func(to types.JID, id types.MessageID, msg *waE2E.Message)
 	// PreRetryCallback is called before a retry receipt is accepted.
 	// If it returns false, the accepting will be cancelled and the retry receipt will be ignored.
 	PreRetryCallback func(receipt *events.Receipt, id types.MessageID, retryCount int, msg *waE2E.Message) bool
+	// Should whatsmeow store recently sent messages in the database so that retry receipts can be accepted
+	// even if the process is restarted? If false, only the in-memory cache and GetMessageForRetry will be used.
+	UseRetryMessageStore bool
+	lastRetryStoreClear  time.Time
 
 	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and
 	// the client will disconnect.
@@ -468,10 +469,12 @@ func isRetryableConnectError(err error) bool {
 		switch statusErr.StatusCode {
 		case 408, 500, 501, 502, 503, 504:
 			return true
+		default:
+			return false
 		}
 	}
 
-	return false
+	return errors.Is(err, socket.ErrDialFailed)
 }
 
 func (cli *Client) ConnectContext(ctx context.Context) error {
@@ -500,6 +503,9 @@ func (cli *Client) connect(ctx context.Context) error {
 }
 
 func (cli *Client) unlockedConnect(ctx context.Context) error {
+	if cli.Store.Deleted {
+		return store.ErrDeviceDeleted
+	}
 	if cli.socket != nil {
 		if !cli.socket.IsConnected() {
 			cli.unlockedDisconnect()
