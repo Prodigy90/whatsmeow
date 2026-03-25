@@ -155,6 +155,12 @@ type Client struct {
 	UseRetryMessageStore bool
 	lastRetryStoreClear  time.Time
 
+	// OnNoDeviceContacts is called after GetUserDevices when some input JIDs returned 0 devices
+	// from the usync query (meaning they're not on WhatsApp). The callback receives the JIDs
+	// that had no devices. This allows the application to passively learn which contacts are
+	// inactive without making separate IsOnWhatsApp calls.
+	OnNoDeviceContacts func(jids []types.JID)
+
 	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and
 	// the client will disconnect.
 	PrePairCallback func(jid types.JID, platform, businessName string) bool

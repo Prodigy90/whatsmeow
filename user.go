@@ -474,6 +474,9 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 			return nil, err
 		}
 
+		// Track which input JIDs got devices back from usync (keyed by non-AD JID for safe comparison)
+		jidsWithDevices := make(map[types.JID]bool, len(jidsToSync))
+
 		for _, user := range list.GetChildren() {
 			jid, jidOK := user.Attrs["jid"].(types.JID)
 			if user.Tag != "user" || !jidOK {
@@ -482,6 +485,22 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 			userDevices := parseDeviceList(jid, user.GetChildByTag("devices"))
 			cli.userDevicesCache[jid] = deviceCache{devices: userDevices, dhash: participantListHashV2(userDevices)}
 			devices = append(devices, userDevices...)
+			if len(userDevices) > 0 {
+				jidsWithDevices[jid.ToNonAD()] = true
+			}
+		}
+
+		// Fire callback for JIDs that returned 0 devices (not on WhatsApp)
+		if cli.OnNoDeviceContacts != nil {
+			var noDeviceJIDs []types.JID
+			for _, jid := range jidsToSync {
+				if !jidsWithDevices[jid.ToNonAD()] {
+					noDeviceJIDs = append(noDeviceJIDs, jid)
+				}
+			}
+			if len(noDeviceJIDs) > 0 {
+				go cli.OnNoDeviceContacts(noDeviceJIDs)
+			}
 		}
 	}
 
