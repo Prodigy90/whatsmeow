@@ -43,9 +43,17 @@ func (cli *Client) handleReceipt(ctx context.Context, node *waBinary.Node) {
 	}
 }
 
-func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participants *waBinary.Node) {
+func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participants *waBinary.Node, fallbackMessageID types.MessageID) {
 	pag := participants.AttrGetter()
-	partialReceipt.MessageIDs = []types.MessageID{pag.String("key")}
+	// WhatsApp uses "message_id" for status broadcast receipts, "key" for other grouped receipts
+	key := pag.OptionalString("message_id")
+	if key == "" {
+		key = pag.OptionalString("key")
+	}
+	if key == "" {
+		key = fallbackMessageID
+	}
+	partialReceipt.MessageIDs = []types.MessageID{key}
 	for _, child := range participants.GetChildren() {
 		if child.Tag != "user" {
 			cli.Log.Warnf("Unexpected node in grouped receipt participants: %s", child.XMLString())
@@ -55,6 +63,15 @@ func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participa
 		receipt := partialReceipt
 		receipt.Timestamp = ag.UnixTime("t")
 		receipt.MessageSource.Sender = ag.JID("jid")
+		// Status broadcast receipts put the type on each <user> node (e.g. "delivery", "read")
+		// rather than on the parent <receipt> node. Read from user node when present.
+		if userType := ag.OptionalString("type"); userType != "" {
+			if userType == "delivery" {
+				receipt.Type = types.ReceiptTypeDelivered
+			} else {
+				receipt.Type = types.ReceiptType(userType)
+			}
+		}
 		if !ag.OK() {
 			cli.Log.Warnf("Failed to parse user node %s in grouped receipt: %v", child.XMLString(), ag.Error())
 			continue
@@ -76,12 +93,13 @@ func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, error) {
 		MessageSender: ag.OptionalJIDOrEmpty("recipient"),
 	}
 	if source.IsGroup && source.Sender.IsEmpty() {
+		fallbackMessageID := ag.OptionalString("id")
 		participantTags := node.GetChildrenByTag("participants")
 		if len(participantTags) == 0 {
 			return nil, &ElementMissingError{Tag: "participants", In: "grouped receipt"}
 		}
 		for _, pcp := range participantTags {
-			cli.handleGroupedReceipt(receipt, &pcp)
+			cli.handleGroupedReceipt(receipt, &pcp, fallbackMessageID)
 		}
 		return nil, nil
 	}

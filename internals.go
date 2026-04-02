@@ -539,8 +539,8 @@ func (int *DangerousInternalClient) HandleReceipt(ctx context.Context, node *waB
 	int.c.handleReceipt(ctx, node)
 }
 
-func (int *DangerousInternalClient) HandleGroupedReceipt(partialReceipt events.Receipt, participants *waBinary.Node) {
-	int.c.handleGroupedReceipt(partialReceipt, participants)
+func (int *DangerousInternalClient) HandleGroupedReceipt(partialReceipt events.Receipt, participants *waBinary.Node, fallbackMessageID types.MessageID) {
+	int.c.handleGroupedReceipt(partialReceipt, participants, fallbackMessageID)
 }
 
 func (int *DangerousInternalClient) ParseReceipt(node *waBinary.Node) (*events.Receipt, error) {
