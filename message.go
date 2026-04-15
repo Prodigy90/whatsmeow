@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"time"
@@ -805,6 +806,13 @@ func (cli *Client) handleProtocolMessage(ctx context.Context, info *types.Messag
 			if cli.historySyncHandlerStarted.CompareAndSwap(false, true) {
 				go cli.handleHistorySyncNotificationLoop()
 			}
+		} else {
+			// Release the decoded notification (InitialHistBootstrapInlinePayload
+			// can be 50-100MB+) and force a GC cycle. Without this, the blob
+			// stays reachable through the caller's `msg` until the next natural
+			// GC, which on memory-limited pods arrives after OOMKilled.
+			protoMsg.HistorySyncNotification = nil
+			runtime.GC()
 		}
 		go cli.sendProtocolMessageReceipt(ctx, info.ID, types.ReceiptTypeHistorySync)
 	}
