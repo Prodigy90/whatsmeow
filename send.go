@@ -128,6 +128,11 @@ type SendResponse struct {
 	// The identity the message was sent with (LID or PN)
 	// This is currently not reliable in all cases.
 	Sender types.JID
+
+	// Full XML of the server's <ack> when the send failed with a non-zero error code.
+	// Populated only on errorCode != 0 — used to inspect any per-participant child nodes
+	// the server may include but that are not surfaced through the top-level error code.
+	RawErrorResponse string
 }
 
 // SendRequestExtra contains the optional parameters for SendMessage.
@@ -453,6 +458,9 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	resp.Timestamp = ag.UnixTime("t")
 	if errorCode := ag.Int("error"); errorCode != 0 {
 		err = fmt.Errorf("%w %d", ErrServerReturnedError, errorCode)
+		resp.RawErrorResponse = respNode.XMLString()
+		cli.Log.Warnf("Server-returned error %d on send to %s (id=%s, phash=%s): %s",
+			errorCode, to, req.ID, phash, resp.RawErrorResponse)
 	}
 	expectedPHash := ag.OptionalString("phash")
 	if len(expectedPHash) > 0 && phash != expectedPHash {
