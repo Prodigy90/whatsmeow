@@ -1197,12 +1197,17 @@ func (cli *Client) prepareMessageNode(
 	}
 
 	if len(extraParams.excludeDevices) > 0 {
+		// Compare on the non-AD form (user@server) so an excluded user@lid filters every
+		// one of that user's device-suffixed JIDs from the participant list. WA's `participant`
+		// attribute on a 429 ack is bare (no .device), but GetUserDevices returns AD JIDs —
+		// without ToNonAD on both sides, a stored user@lid (Device=0) wouldn't match
+		// user@lid.5 etc. and the filter would be a no-op for non-primary devices.
 		excluded := make(map[types.JID]struct{}, len(extraParams.excludeDevices))
 		for _, jid := range extraParams.excludeDevices {
-			excluded[jid] = struct{}{}
+			excluded[jid.ToNonAD()] = struct{}{}
 		}
 		allDevices = slices.DeleteFunc(allDevices, func(jid types.JID) bool {
-			_, drop := excluded[jid]
+			_, drop := excluded[jid.ToNonAD()]
 			return drop
 		})
 	}
