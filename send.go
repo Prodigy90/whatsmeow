@@ -133,6 +133,14 @@ type SendResponse struct {
 	// Populated only on errorCode != 0 — used to inspect any per-participant child nodes
 	// the server may include but that are not surfaced through the top-level error code.
 	RawErrorResponse string
+
+	// Specific device JID the server rejected, parsed from the ack's `participant` attribute.
+	// Empty when the rejection wasn't participant-specific (e.g. generic 429 with `phash`).
+	RejectedParticipant types.JID
+
+	// Server-suggested backoff in seconds before retrying, parsed from the ack's `backoff` attribute.
+	// Zero when not present.
+	BackoffSeconds int
 }
 
 // SendRequestExtra contains the optional parameters for SendMessage.
@@ -166,6 +174,11 @@ type SendRequestExtra struct {
 
 	// When sending status message you can specify the recipients
 	Participants []types.JID
+
+	// Device JIDs to drop from the participant list after GetUserDevices but before encryption.
+	// Used to skip server-rejected device JIDs (e.g. LIDs the WA server returns 429 on)
+	// without having to remove the underlying contact from the audience.
+	ExcludeDevices []types.JID
 }
 
 // SendMessage sends the given message.
@@ -377,6 +390,10 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		extraParams.additionalNodes = req.AdditionalNodes
 	}
 
+	if len(req.ExcludeDevices) > 0 {
+		extraParams.excludeDevices = req.ExcludeDevices
+	}
+
 	resp.Sender = ownID
 
 	start := time.Now()
@@ -459,8 +476,12 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	if errorCode := ag.Int("error"); errorCode != 0 {
 		err = fmt.Errorf("%w %d", ErrServerReturnedError, errorCode)
 		resp.RawErrorResponse = respNode.XMLString()
-		cli.Log.Warnf("Server-returned error %d on send to %s (id=%s, phash=%s): %s",
-			errorCode, to, req.ID, phash, resp.RawErrorResponse)
+		if rejected := ag.OptionalJID("participant"); rejected != nil {
+			resp.RejectedParticipant = *rejected
+		}
+		resp.BackoffSeconds = ag.OptionalInt("backoff")
+		cli.Log.Warnf("Server-returned error %d on send to %s (id=%s, phash=%s, rejected=%s, backoff=%d): %s",
+			errorCode, to, req.ID, phash, resp.RejectedParticipant, resp.BackoffSeconds, resp.RawErrorResponse)
 	}
 	expectedPHash := ag.OptionalString("phash")
 	if len(expectedPHash) > 0 && phash != expectedPHash {
@@ -758,6 +779,7 @@ type nodeExtraParams struct {
 	metaNode        *waBinary.Node
 	additionalNodes *[]waBinary.Node
 	addressingMode  types.AddressingMode
+	excludeDevices  []types.JID
 }
 
 func (cli *Client) sendGroup(
@@ -1171,6 +1193,17 @@ func (cli *Client) prepareMessageNode(
 	if to.Server == types.GroupServer {
 		allDevices = slices.DeleteFunc(allDevices, func(jid types.JID) bool {
 			return jid.Server == types.HostedServer || jid.Server == types.HostedLIDServer
+		})
+	}
+
+	if len(extraParams.excludeDevices) > 0 {
+		excluded := make(map[types.JID]struct{}, len(extraParams.excludeDevices))
+		for _, jid := range extraParams.excludeDevices {
+			excluded[jid] = struct{}{}
+		}
+		allDevices = slices.DeleteFunc(allDevices, func(jid types.JID) bool {
+			_, drop := excluded[jid]
+			return drop
 		})
 	}
 
