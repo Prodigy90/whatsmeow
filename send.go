@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -1430,7 +1431,7 @@ func (cli *Client) encryptMessageForDevices(
 			defer func() { <-sem }()
 			defer func() {
 				if r := recover(); r != nil {
-					results[idx] = encResult{err: fmt.Errorf("panic encrypting for %s: %v", j, r)}
+					results[idx] = encResult{err: fmt.Errorf("panic encrypting for %s: %v\n%s", j, r, debug.Stack())}
 				}
 			}()
 			encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(

@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"slices"
 	"strings"
 
@@ -499,7 +500,7 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 				}
 			}
 			if len(noDeviceJIDs) > 0 {
-				go cli.OnNoDeviceContacts(noDeviceJIDs)
+				go cli.tryOnNoDeviceContacts(ctx, noDeviceJIDs)
 			}
 		}
 	}
@@ -513,6 +514,24 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 	}
 
 	return devices, nil
+}
+
+// tryOnNoDeviceContacts invokes the OnNoDeviceContacts callback under panic recovery and
+// (optionally) bounded by cli.noDeviceContactsSema. Application callbacks are user code,
+// so a panic here must not crash the worker; we log with a full stack trace for diagnosis.
+func (cli *Client) tryOnNoDeviceContacts(ctx context.Context, jids []types.JID) {
+	defer func() {
+		if r := recover(); r != nil {
+			cli.Log.Errorf("OnNoDeviceContacts callback panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
+	if cli.noDeviceContactsSema != nil {
+		if err := cli.noDeviceContactsSema.Acquire(ctx, 1); err != nil {
+			return
+		}
+		defer cli.noDeviceContactsSema.Release(1)
+	}
+	cli.OnNoDeviceContacts(jids)
 }
 
 type GetProfilePictureParams struct {

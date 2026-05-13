@@ -168,7 +168,12 @@ type Client struct {
 	// from the usync query (meaning they're not on WhatsApp). The callback receives the JIDs
 	// that had no devices. This allows the application to passively learn which contacts are
 	// inactive without making separate IsOnWhatsApp calls.
-	OnNoDeviceContacts func(jids []types.JID)
+	//
+	// The callback runs in a new goroutine. Panics are recovered and logged with a stack trace
+	// so application code panics don't crash the worker. Use SetMaxParallelNoDeviceContactsCallbacks
+	// to bound concurrent invocations under heavy GetUserDevices load.
+	OnNoDeviceContacts   func(jids []types.JID)
+	noDeviceContactsSema *semaphore.Weighted
 
 	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and
 	// the client will disconnect.
@@ -427,6 +432,17 @@ func (cli *Client) SetMaxParallelRetryReceiptHandling(n int64) {
 		cli.retrySema = nil
 	} else {
 		cli.retrySema = semaphore.NewWeighted(n)
+	}
+}
+
+// SetMaxParallelNoDeviceContactsCallbacks sets how many OnNoDeviceContacts callback goroutines
+// can run in parallel. Defaults to unlimited. This should only be set before connecting,
+// changing it afterwards can cause data races.
+func (cli *Client) SetMaxParallelNoDeviceContactsCallbacks(n int64) {
+	if n <= 0 {
+		cli.noDeviceContactsSema = nil
+	} else {
+		cli.noDeviceContactsSema = semaphore.NewWeighted(n)
 	}
 }
 
