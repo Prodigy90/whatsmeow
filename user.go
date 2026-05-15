@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"slices"
 	"strings"
 
@@ -477,6 +478,14 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 		// Track which input JIDs got devices back from usync (keyed by non-AD JID for safe comparison)
 		jidsWithDevices := make(map[types.JID]bool, len(jidsToSync))
 
+		// Harvest LID mappings inline with the device query. WA returns `<lid val="...@lid">`
+		// children on `<user>` nodes when a PN has a LID partner — same shape GetUserInfo
+		// parses at the IQ-response level. Capturing here closes the gap where send-path
+		// GetUserDevices calls would otherwise pass through this mapping data without
+		// persisting it, leaving Store.LIDs cold for LIDs we just routed a message to.
+		// Baileys does the equivalent in messages-send.ts (storeLIDPNMappings filter on a.lid).
+		lidMappings := make([]store.LIDMapping, 0)
+
 		for _, user := range list.GetChildren() {
 			jid, jidOK := user.Attrs["jid"].(types.JID)
 			if user.Tag != "user" || !jidOK {
@@ -487,6 +496,19 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 			devices = append(devices, userDevices...)
 			if len(userDevices) > 0 {
 				jidsWithDevices[jid.ToNonAD()] = true
+			}
+
+			lidTag := user.GetChildByTag("lid")
+			if lid := lidTag.AttrGetter().OptionalJIDOrEmpty("val"); !lid.IsEmpty() {
+				lidMappings = append(lidMappings, store.LIDMapping{PN: jid, LID: lid})
+			}
+		}
+
+		if len(lidMappings) > 0 {
+			if err := cli.Store.LIDs.PutManyLIDMappings(ctx, lidMappings); err != nil {
+				cli.Log.Errorf("Failed to store LID mappings from GetUserDevices usync: %v", err)
+			} else {
+				cli.Log.Infof("GetUserDevices: harvested %d LID mappings from %d input JIDs", len(lidMappings), len(jidsToSync))
 			}
 		}
 
@@ -499,7 +521,7 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 				}
 			}
 			if len(noDeviceJIDs) > 0 {
-				go cli.OnNoDeviceContacts(noDeviceJIDs)
+				go cli.tryOnNoDeviceContacts(ctx, noDeviceJIDs)
 			}
 		}
 	}
@@ -513,6 +535,24 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 	}
 
 	return devices, nil
+}
+
+// tryOnNoDeviceContacts invokes the OnNoDeviceContacts callback under panic recovery and
+// (optionally) bounded by cli.noDeviceContactsSema. Application callbacks are user code,
+// so a panic here must not crash the worker; we log with a full stack trace for diagnosis.
+func (cli *Client) tryOnNoDeviceContacts(ctx context.Context, jids []types.JID) {
+	defer func() {
+		if r := recover(); r != nil {
+			cli.Log.Errorf("OnNoDeviceContacts callback panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
+	if cli.noDeviceContactsSema != nil {
+		if err := cli.noDeviceContactsSema.Acquire(ctx, 1); err != nil {
+			return
+		}
+		defer cli.noDeviceContactsSema.Release(1)
+	}
+	cli.OnNoDeviceContacts(jids)
 }
 
 type GetProfilePictureParams struct {

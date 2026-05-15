@@ -27,17 +27,7 @@ func (cli *Client) handleReceipt(ctx context.Context, node *waBinary.Node) {
 		cli.Log.Warnf("Failed to parse receipt: %v", err)
 	} else if receipt != nil {
 		if receipt.Type == types.ReceiptTypeRetry {
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						cli.Log.Errorf("Panic in handleRetryReceipt for %s/%s from %s: %v", receipt.Chat, receipt.MessageIDs[0], receipt.Sender, r)
-					}
-				}()
-				err := cli.handleRetryReceipt(ctx, receipt, node)
-				if err != nil {
-					cli.Log.Errorf("Failed to handle retry receipt for %s/%s from %s: %v", receipt.Chat, receipt.MessageIDs[0], receipt.Sender, err)
-				}
-			}()
+			go cli.tryHandleRetryReceipt(ctx, receipt, node)
 		}
 		cancelled = cli.dispatchEvent(receipt)
 	}
@@ -45,7 +35,8 @@ func (cli *Client) handleReceipt(ctx context.Context, node *waBinary.Node) {
 
 func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participants *waBinary.Node, fallbackMessageID types.MessageID) {
 	pag := participants.AttrGetter()
-	// WhatsApp uses "message_id" for status broadcast receipts, "key" for other grouped receipts
+	// WhatsApp uses "message_id" for status broadcast receipts, "key" for other grouped receipts.
+	// Falls back to the parent <receipt> node's id when neither attr is set (newer status broadcast format).
 	key := pag.OptionalString("message_id")
 	if key == "" {
 		key = pag.OptionalString("key")
