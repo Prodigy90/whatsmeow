@@ -1273,7 +1273,9 @@ func (cli *Client) prepareMessageNode(
 		Tag:   "message",
 		Attrs: attrs,
 		Content: cli.getMessageContent(
-			participantNode, message, attrs, includeIdentity, extraParams,
+			participantNode, message, attrs,
+			includeIdentity || to.Server == types.BroadcastServer,
+			extraParams,
 		),
 	}, allDevices, nil
 }
