@@ -835,7 +835,9 @@ func (cli *Client) sendGroup(
 	}
 
 	phash := participantListHashV2(allDevices)
-	node.Attrs["phash"] = phash
+	if to.Server != types.BroadcastServer {
+		node.Attrs["phash"] = phash
+	}
 	skMsg := waBinary.Node{
 		Tag:     "enc",
 		Content: ciphertext,
