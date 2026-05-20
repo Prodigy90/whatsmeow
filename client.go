@@ -26,6 +26,7 @@ import (
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/util/random"
 	"golang.org/x/net/proxy"
+	"golang.org/x/sync/semaphore"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -99,9 +100,10 @@ type Client struct {
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
 
-	historySyncNotifications  chan *waE2E.HistorySyncNotification
-	historySyncHandlerStarted atomic.Bool
-	ManualHistorySyncDownload bool
+	historySyncNotifications        chan *waE2E.HistorySyncNotification
+	historySyncHandlerStarted       atomic.Bool
+	ManualHistorySyncDownload       bool
+	DisableManualHistorySyncReceipt bool
 
 	uploadPreKeysLock sync.Mutex
 	lastPreKeyUpload  time.Time
@@ -119,6 +121,7 @@ type Client struct {
 
 	messageRetries     map[string]int
 	messageRetriesLock sync.Mutex
+	retrySema          *semaphore.Weighted
 
 	incomingRetryRequestCounter     map[incomingRetryKey]int
 	incomingRetryRequestCounterLock sync.Mutex
@@ -127,6 +130,12 @@ type Client struct {
 	appStateKeyRequestsLock sync.RWMutex
 
 	messageSendLock sync.Mutex
+
+	tcTokenSenderTS            map[types.JID]time.Time
+	tcTokenSenderTSLock        sync.Mutex
+	lastTCTokenSenderTSCleanup time.Time
+	tcTokenDBPruneLock         sync.Mutex
+	lastTCTokenDBPrune         time.Time
 
 	privacySettingsCache atomic.Value
 
@@ -159,7 +168,12 @@ type Client struct {
 	// from the usync query (meaning they're not on WhatsApp). The callback receives the JIDs
 	// that had no devices. This allows the application to passively learn which contacts are
 	// inactive without making separate IsOnWhatsApp calls.
-	OnNoDeviceContacts func(jids []types.JID)
+	//
+	// The callback runs in a new goroutine. Panics are recovered and logged with a stack trace
+	// so application code panics don't crash the worker. Use SetMaxParallelNoDeviceContactsCallbacks
+	// to bound concurrent invocations under heavy GetUserDevices load.
+	OnNoDeviceContacts   func(jids []types.JID)
+	noDeviceContactsSema *semaphore.Weighted
 
 	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and
 	// the client will disconnect.
@@ -168,6 +182,7 @@ type Client struct {
 	// GetClientPayload is called to get the client payload for connecting to the server.
 	// This should NOT be used for WhatsApp (to change the OS name, update fields in store.BaseClientPayload directly).
 	GetClientPayload func() *waWa6.ClientPayload
+	QRClientType     PairClientType
 
 	// Should untrusted identity errors be handled automatically? If true, the stored identity and existing signal
 	// sessions will be removed on untrusted identity errors, and an events.IdentityChange will be dispatched.
@@ -262,6 +277,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 
 		historySyncNotifications: make(chan *waE2E.HistorySyncNotification, 32),
 
+		tcTokenSenderTS:  make(map[types.JID]time.Time),
 		groupCache:       make(map[types.JID]*groupMetaCache),
 		userDevicesCache: make(map[types.JID]deviceCache),
 
@@ -407,6 +423,27 @@ func (cli *Client) SetWebsocketHTTPClient(h *http.Client) {
 // This will overwrite any set proxy calls.
 func (cli *Client) SetPreLoginHTTPClient(h *http.Client) {
 	cli.preLoginHTTP = h
+}
+
+// SetMaxParallelRetryReceiptHandling sets how many retry receipts can be handled in parallel.
+// Defaults to unlimited. This should only be set before connecting, changing it afterwards can cause data races.
+func (cli *Client) SetMaxParallelRetryReceiptHandling(n int64) {
+	if n <= 0 {
+		cli.retrySema = nil
+	} else {
+		cli.retrySema = semaphore.NewWeighted(n)
+	}
+}
+
+// SetMaxParallelNoDeviceContactsCallbacks sets how many OnNoDeviceContacts callback goroutines
+// can run in parallel. Defaults to unlimited. This should only be set before connecting,
+// changing it afterwards can cause data races.
+func (cli *Client) SetMaxParallelNoDeviceContactsCallbacks(n int64) {
+	if n <= 0 {
+		cli.noDeviceContactsSema = nil
+	} else {
+		cli.noDeviceContactsSema = semaphore.NewWeighted(n)
+	}
 }
 
 func (cli *Client) getSocketWaitChan() <-chan struct{} {
