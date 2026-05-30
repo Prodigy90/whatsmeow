@@ -99,14 +99,16 @@ func (cli *Client) PrewarmSessions(ctx context.Context, jids []types.JID, opts P
 	encIdentity := make(map[types.JID]types.JID, len(allDevices))
 	addrToOriginal := make(map[string]types.JID, len(allDevices))
 	sessionAddresses := make([]string, 0, len(allDevices))
+	pnToLIDMappings := make(map[types.JID]types.JID)
 	for _, jid := range allDevices {
 		if jid == ownJID || jid == ownLID {
-			continue // never warm our own devices; the send skips them too
+			continue // skip the primary own JID/LID; the send skips them too
 		}
 		identity := jid
 		if jid.Server == types.DefaultUserServer {
 			if lid, ok := lidMappings[jid]; ok && !lid.IsEmpty() {
 				identity = lid
+				pnToLIDMappings[jid] = lid
 			}
 		}
 		encIdentity[jid] = identity
@@ -116,6 +118,17 @@ func (cli *Client) PrewarmSessions(ctx context.Context, jids []types.JID, opts P
 	}
 	if len(sessionAddresses) == 0 {
 		return res, nil
+	}
+
+	// Migrate any PN-addressed sessions/identities to their LID address before
+	// the cached lookup, exactly as the send does. Without this, a device whose
+	// session still lives under the old PN address reads as cold under its LID
+	// address and gets a redundant prekey re-fetch (wasted traffic + a bogus
+	// "warmed" count). Mirrors encryptMessageForDevices.
+	if len(pnToLIDMappings) > 0 {
+		if mErr := cli.Store.Sessions.MigrateManyPNsToLIDs(ctx, pnToLIDMappings); mErr != nil {
+			cli.Log.Errorf("Prewarm: failed to migrate PN→LID sessions: %v", mErr)
+		}
 	}
 
 	// 3. Bulk-load existing sessions + identities into a request-scoped cache.
@@ -168,7 +181,10 @@ func (cli *Client) PrewarmSessions(ctx context.Context, jids []types.JID, opts P
 		if opts.BatchDelay > 0 && end < len(coldOriginals) {
 			select {
 			case <-ctx.Done():
-				cli.flushPrewarmCaches(ctx)
+				// Persist what we warmed so far. Flush on a non-cancelled ctx —
+				// PutCachedSessions issues DB writes that would fail on the
+				// already-cancelled ctx, losing the partial pass.
+				_ = cli.flushPrewarmCaches(context.WithoutCancel(ctx))
 				return res, ctx.Err()
 			case <-time.After(opts.BatchDelay):
 			}
