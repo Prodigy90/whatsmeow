@@ -14,6 +14,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -454,6 +455,27 @@ func (cli *Client) GetUserDevicesContext(ctx context.Context, jids []types.JID) 
 	return cli.GetUserDevices(ctx, jids)
 }
 
+// maxUsyncUsersPerQuery caps the number of <user> nodes in a single usync IQ.
+// Native WhatsApp Web never exceeds 500 <user> nodes per usync query
+// (empirically captured); a single oversized usync is held by the server ~8-11s
+// and then drops the socket, immediately followed by a 403 account lock. Larger
+// inputs are split into sequential ≤500-user queries. Mirrors the chunking
+// getFBIDDevices already does for Messenger JIDs.
+const maxUsyncUsersPerQuery = 500
+
+// usyncDeviceChunks splits a JID list into consecutive chunks no larger than
+// maxUsyncUsersPerQuery, preserving order. Returns nil for an empty input.
+func usyncDeviceChunks(jids []types.JID) [][]types.JID {
+	if len(jids) == 0 {
+		return nil
+	}
+	chunks := make([][]types.JID, 0, (len(jids)+maxUsyncUsersPerQuery-1)/maxUsyncUsersPerQuery)
+	for chunk := range slices.Chunk(jids, maxUsyncUsersPerQuery) {
+		chunks = append(chunks, chunk)
+	}
+	return chunks
+}
+
 // GetUserDevices gets the list of devices that the given user has. The input should be a list of
 // regular JIDs, and the output will be a list of AD JIDs. The local device will not be included in
 // the output even if the user's JID is included in the input. All other devices will be included.
@@ -479,14 +501,6 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 		}
 	}
 	if len(jidsToSync) > 0 {
-		list, err := cli.usync(ctx, jidsToSync, "query", "message", []waBinary.Node{
-			{Tag: "devices", Attrs: waBinary.Attrs{"version": "2"}},
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		// Track which input JIDs got devices back from usync (keyed by non-AD JID for safe comparison)
 		jidsWithDevices := make(map[types.JID]bool, len(jidsToSync))
 
 		// Harvest LID mappings inline with the device query. WA returns `<lid val="...@lid">`
@@ -497,23 +511,15 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 		// Baileys does the equivalent in messages-send.ts (storeLIDPNMappings filter on a.lid).
 		lidMappings := make([]store.LIDMapping, 0)
 
-		for _, user := range list.GetChildren() {
-			jid, jidOK := user.Attrs["jid"].(types.JID)
-			if user.Tag != "user" || !jidOK {
-				continue
-			}
-			userDevices := parseDeviceList(jid, user.GetChildByTag("devices"))
-			cli.userDevicesCache[jid] = deviceCache{devices: userDevices, dhash: participantListHashV2(userDevices)}
-			devices = append(devices, userDevices...)
-			if len(userDevices) > 0 {
-				jidsWithDevices[jid.ToNonAD()] = true
-			}
-
-			lidTag := user.GetChildByTag("lid")
-			if lid := lidTag.AttrGetter().OptionalJIDOrEmpty("val"); !lid.IsEmpty() {
-				lidMappings = append(lidMappings, store.LIDMapping{PN: jid, LID: lid})
-			}
+		// usync() caps each IQ at ≤maxUsyncUsersPerQuery and merges the chunked
+		// response, so jidsToSync may be any size here.
+		list, err := cli.usync(ctx, jidsToSync, "query", "message", []waBinary.Node{
+			{Tag: "devices", Attrs: waBinary.Attrs{"version": "2"}},
+		})
+		if err != nil {
+			return nil, err
 		}
+		cli.foldUsyncDevices(list, &devices, jidsWithDevices, &lidMappings)
 
 		if len(lidMappings) > 0 {
 			if err := cli.Store.LIDs.PutManyLIDMappings(ctx, lidMappings); err != nil {
@@ -545,6 +551,129 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 		devices = append(devices, userDevices...)
 	}
 
+	return devices, nil
+}
+
+// foldUsyncDevices parses one usync device-query response <list> into the device
+// cache and the given accumulators (devices resolved, JIDs that returned ≥1
+// device, harvested PN→LID mappings). The caller MUST hold userDevicesCacheLock.
+func (cli *Client) foldUsyncDevices(list *waBinary.Node, devices *[]types.JID, jidsWithDevices map[types.JID]bool, lidMappings *[]store.LIDMapping) {
+	for _, user := range list.GetChildren() {
+		jid, jidOK := user.Attrs["jid"].(types.JID)
+		if user.Tag != "user" || !jidOK {
+			continue
+		}
+		userDevices := parseDeviceList(jid, user.GetChildByTag("devices"))
+		cli.userDevicesCache[jid] = deviceCache{devices: userDevices, dhash: participantListHashV2(userDevices)}
+		*devices = append(*devices, userDevices...)
+		if len(userDevices) > 0 {
+			jidsWithDevices[jid.ToNonAD()] = true
+		}
+		lidTag := user.GetChildByTag("lid")
+		if lid := lidTag.AttrGetter().OptionalJIDOrEmpty("val"); !lid.IsEmpty() {
+			*lidMappings = append(*lidMappings, store.LIDMapping{PN: jid, LID: lid})
+		}
+	}
+}
+
+// GetUserDevicesPaced resolves device lists like GetUserDevices, but issues the
+// usync in ≤maxUsyncUsersPerQuery chunks spaced chunkDelay apart, in the given
+// usync context ("background" mirrors native WA Web's roster warm). Unlike
+// GetUserDevices it does NOT hold userDevicesCacheLock across the (possibly
+// minutes-long) paced loop — it locks only for the brief cache read/write per
+// chunk — so a slow warm can't block live device lookups. Returns the devices
+// resolved so far if ctx is cancelled or a chunk errors. Intended for the
+// decoupled session pre-warmer, not the send path. Each chunk emits an
+// attribution log (path=prewarm_warm) so a canary can tell pacing/context apart
+// from the send-path resolver.
+func (cli *Client) GetUserDevicesPaced(ctx context.Context, jids []types.JID, chunkDelay time.Duration, usyncContext string) ([]types.JID, error) {
+	if cli == nil {
+		return nil, ErrClientIsNil
+	}
+	if usyncContext == "" {
+		usyncContext = "background"
+	}
+
+	// Brief lock: filter cached JIDs from the ones we still need to resolve.
+	cli.userDevicesCacheLock.Lock()
+	var devices, jidsToSync []types.JID
+	skipped := 0
+	for _, jid := range jids {
+		cached, ok := cli.userDevicesCache[jid]
+		switch {
+		case ok && len(cached.devices) > 0:
+			devices = append(devices, cached.devices...)
+		case jid.Server == types.DefaultUserServer || jid.Server == types.HiddenUserServer:
+			jidsToSync = append(jidsToSync, jid)
+		default:
+			skipped++ // Messenger/bot/legacy JIDs aren't warmed by the pre-warmer
+		}
+	}
+	cli.userDevicesCacheLock.Unlock()
+	if skipped > 0 {
+		cli.Log.Debugf("GetUserDevicesPaced: skipped %d non-PN/LID JIDs (Messenger/bot/legacy not warmed)", skipped)
+	}
+
+	chunks := usyncDeviceChunks(jidsToSync)
+	jidsWithDevices := make(map[types.JID]bool, len(jidsToSync))
+	lidMappings := make([]store.LIDMapping, 0)
+	cli.Log.Infof("usync_resolve path=prewarm_warm to_sync=%d cached=%d chunks=%d cap=%d context=%s paced=true delay_ms=%d",
+		len(jidsToSync), len(devices), len(chunks), maxUsyncUsersPerQuery, usyncContext, chunkDelay.Milliseconds())
+
+	var chunkErr error
+	for i, chunk := range chunks {
+		if i > 0 && chunkDelay > 0 {
+			select {
+			case <-ctx.Done():
+				chunkErr = ctx.Err()
+			case <-time.After(chunkDelay):
+			}
+			if chunkErr != nil {
+				break
+			}
+		}
+		// Per-IQ size/context are logged by usync() (usync_send); the ~delay_ms
+		// gap between these chunks shows the pacing in the timestamps.
+		list, err := cli.usync(ctx, chunk, "query", usyncContext, []waBinary.Node{
+			{Tag: "devices", Attrs: waBinary.Attrs{"version": "2"}},
+		})
+		if err != nil {
+			chunkErr = fmt.Errorf("prewarm usync chunk %d/%d: %w", i+1, len(chunks), err)
+			break
+		}
+		cli.userDevicesCacheLock.Lock()
+		cli.foldUsyncDevices(list, &devices, jidsWithDevices, &lidMappings)
+		cli.userDevicesCacheLock.Unlock()
+	}
+
+	// Persist harvested LID→PN mappings even on a partial/cancelled run — the
+	// chunks that succeeded resolved real mappings, and dropping them on a chunk
+	// error (the old early-return) just forces the next warm to re-harvest them.
+	if len(lidMappings) > 0 {
+		if err := cli.Store.LIDs.PutManyLIDMappings(ctx, lidMappings); err != nil {
+			cli.Log.Errorf("Failed to store LID mappings from paced usync: %v", err)
+		}
+	}
+
+	if chunkErr != nil {
+		return devices, chunkErr
+	}
+
+	// Fire the no-device callback for JIDs that returned 0 devices, matching
+	// GetUserDevices — otherwise warming would stop marking not-on-WhatsApp
+	// contacts inactive (a silent regression vs the send path). Only after a
+	// fully resolved run — a partial run hasn't attempted every JID.
+	if cli.OnNoDeviceContacts != nil {
+		var noDeviceJIDs []types.JID
+		for _, jid := range jidsToSync {
+			if !jidsWithDevices[jid.ToNonAD()] {
+				noDeviceJIDs = append(noDeviceJIDs, jid)
+			}
+		}
+		if len(noDeviceJIDs) > 0 {
+			go cli.tryOnNoDeviceContacts(ctx, noDeviceJIDs)
+		}
+	}
 	return devices, nil
 }
 
@@ -903,14 +1032,44 @@ type UsyncQueryExtras struct {
 	BotListInfo []types.BotListInfo
 }
 
+// usync resolves a usync query, automatically splitting jids into chunks no
+// larger than maxUsyncUsersPerQuery so no single IQ exceeds the size WhatsApp
+// tolerates — a larger usync is held ~8-11s and then drops the socket, followed
+// by a 403 account lock. This is the single cap for ALL usync callers
+// (GetUserDevices, GetUserInfo, IsOnWhatsApp, the pre-warmer, …). Multi-chunk
+// responses are merged into one <list> node (every caller iterates its <user>
+// children, none reads list-level attrs). Each IQ is logged (usync_send) for
+// ban attribution.
 func (cli *Client) usync(ctx context.Context, jids []types.JID, mode, context string, query []waBinary.Node, extra ...UsyncQueryExtras) (*waBinary.Node, error) {
 	if cli == nil {
 		return nil, ErrClientIsNil
 	}
-	var extras UsyncQueryExtras
 	if len(extra) > 1 {
 		return nil, errors.New("only one extra parameter may be provided to usync()")
-	} else if len(extra) == 1 {
+	}
+
+	chunks := usyncDeviceChunks(jids)
+	if len(chunks) <= 1 {
+		cli.Log.Infof("usync_send mode=%s context=%s users=%d index=1 total=1", mode, context, len(jids))
+		return cli.usyncOnce(ctx, jids, mode, context, query, extra...)
+	}
+	merged := make([]waBinary.Node, 0, len(jids))
+	for i, chunk := range chunks {
+		cli.Log.Infof("usync_send mode=%s context=%s users=%d index=%d total=%d", mode, context, len(chunk), i+1, len(chunks))
+		list, err := cli.usyncOnce(ctx, chunk, mode, context, query, extra...)
+		if err != nil {
+			return nil, err
+		}
+		merged = append(merged, list.GetChildren()...)
+	}
+	return &waBinary.Node{Tag: "list", Content: merged}, nil
+}
+
+// usyncOnce sends exactly one usync IQ. Callers must keep len(jids) ≤
+// maxUsyncUsersPerQuery — use usync() for the automatic cap + chunking.
+func (cli *Client) usyncOnce(ctx context.Context, jids []types.JID, mode, context string, query []waBinary.Node, extra ...UsyncQueryExtras) (*waBinary.Node, error) {
+	var extras UsyncQueryExtras
+	if len(extra) == 1 {
 		extras = extra[0]
 	}
 
