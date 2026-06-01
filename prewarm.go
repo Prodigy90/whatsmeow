@@ -21,6 +21,13 @@ type PrewarmOpts struct {
 	// BatchDelay is slept between consecutive prekey-fetch batches. Zero means
 	// no delay (back-to-back). Used to spread the acquisition burst.
 	BatchDelay time.Duration
+	// UsyncChunkDelay is slept between consecutive ≤500-user usync (device-list)
+	// chunks during step-1 resolution. Zero means back-to-back. Native WA Web
+	// spaces its 500-user usync chunks ~4-13s apart.
+	UsyncChunkDelay time.Duration
+	// UsyncContext is the usync `context` attr used for device resolution.
+	// Defaults to "background" (WA Web's roster-warm context) when empty.
+	UsyncContext string
 }
 
 // PrewarmResult reports what a PrewarmSessions pass accomplished.
@@ -63,8 +70,11 @@ func (cli *Client) PrewarmSessions(ctx context.Context, jids []types.JID, opts P
 		return res, nil
 	}
 
-	// 1. Resolve the device list (usync) — once, decoupled from any send.
-	allDevices, err := cli.GetUserDevicesContext(ctx, jids)
+	// 1. Resolve the device list (usync) in paced ≤500-user chunks, in
+	//    `background` context — mirrors native WA Web and, crucially, never emits
+	//    the oversized single usync (we observed 2K-21.8K) that the server holds
+	//    ~8-11s and then drops the socket on, immediately followed by a 403 lock.
+	allDevices, err := cli.GetUserDevicesPaced(ctx, jids, opts.UsyncChunkDelay, opts.UsyncContext)
 	if err != nil {
 		return res, fmt.Errorf("prewarm: failed to resolve device list: %w", err)
 	}
