@@ -14,7 +14,6 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
-	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -480,6 +479,13 @@ func usyncDeviceChunks(jids []types.JID) [][]types.JID {
 // regular JIDs, and the output will be a list of AD JIDs. The local device will not be included in
 // the output even if the user's JID is included in the input. All other devices will be included.
 func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]types.JID, error) {
+	return cli.getUserDevices(ctx, jids, "message")
+}
+
+// getUserDevices is GetUserDevices with a parameterized usync `context` attr: sends
+// use "message"; the streaming pre-warmer passes "background" to mirror native WA
+// Web's roster-warm context.
+func (cli *Client) getUserDevices(ctx context.Context, jids []types.JID, usyncContext string) ([]types.JID, error) {
 	if cli == nil {
 		return nil, ErrClientIsNil
 	}
@@ -520,7 +526,7 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 
 		// usync() caps each IQ at ≤maxUsyncUsersPerQuery and merges the chunked
 		// response, so jidsToSync may be any size here.
-		list, err := cli.usync(ctx, jidsToSync, "query", "message", []waBinary.Node{
+		list, err := cli.usync(ctx, jidsToSync, "query", usyncContext, []waBinary.Node{
 			{Tag: "devices", Attrs: waBinary.Attrs{"version": "2"}},
 		})
 		if err != nil {
@@ -669,112 +675,22 @@ func (cli *Client) loadDeviceListsFromStoreLocked(ctx context.Context, jidsToSyn
 	return remaining
 }
 
-// GetUserDevicesPaced resolves device lists like GetUserDevices, but issues the
-// usync in ≤maxUsyncUsersPerQuery chunks spaced chunkDelay apart, in the given
-// usync context ("background" mirrors native WA Web's roster warm). Unlike
-// GetUserDevices it does NOT hold userDevicesCacheLock across the (possibly
-// minutes-long) paced loop — it locks only for the brief cache read/write per
-// chunk — so a slow warm can't block live device lookups. Returns the devices
-// resolved so far if ctx is cancelled or a chunk errors. Intended for the
-// decoupled session pre-warmer, not the send path. Each chunk emits an
-// attribution log (path=prewarm_warm) so a canary can tell pacing/context apart
-// from the send-path resolver.
-func (cli *Client) GetUserDevicesPaced(ctx context.Context, jids []types.JID, chunkDelay time.Duration, usyncContext string) ([]types.JID, error) {
-	if cli == nil {
-		return nil, ErrClientIsNil
+// evictDeviceCache removes the given contacts' device lists from the in-memory
+// cache. Used by the streaming pre-warmer after a chunk is resolved + persisted, so
+// peak memory stays O(chunk): the lists live in the persistent store and reload on
+// demand at send time (read-on-miss). No-op without a persistent store (DeviceLists
+// nil, i.e. DEVICE_CACHE_PERSIST_ENABLED off) — evicting then would just force the
+// next send to re-usync, so the cache is kept and prewarm peak heap reverts to
+// O(roster). The pre-warmer's flat-memory guarantee therefore depends on B1a.
+func (cli *Client) evictDeviceCache(jids []types.JID) {
+	if cli.Store == nil || cli.Store.DeviceLists == nil {
+		return
 	}
-	if usyncContext == "" {
-		usyncContext = "background"
-	}
-
-	// Brief lock: filter cached JIDs from the ones we still need to resolve.
 	cli.userDevicesCacheLock.Lock()
-	var devices, jidsToSync []types.JID
-	skipped := 0
+	defer cli.userDevicesCacheLock.Unlock()
 	for _, jid := range jids {
-		cached, ok := cli.userDevicesCache[jid]
-		switch {
-		case ok && len(cached.devices) > 0:
-			devices = append(devices, cached.devices...)
-		case jid.Server == types.DefaultUserServer || jid.Server == types.HiddenUserServer:
-			jidsToSync = append(jidsToSync, jid)
-		default:
-			skipped++ // Messenger/bot/legacy JIDs aren't warmed by the pre-warmer
-		}
+		delete(cli.userDevicesCache, jid)
 	}
-	// Read-on-miss from the persistent device-list store before any paced usync.
-	jidsToSync = cli.loadDeviceListsFromStoreLocked(ctx, jidsToSync, &devices)
-	cli.userDevicesCacheLock.Unlock()
-	if skipped > 0 {
-		cli.Log.Debugf("GetUserDevicesPaced: skipped %d non-PN/LID JIDs (Messenger/bot/legacy not warmed)", skipped)
-	}
-
-	chunks := usyncDeviceChunks(jidsToSync)
-	jidsWithDevices := make(map[types.JID]bool, len(jidsToSync))
-	lidMappings := make([]store.LIDMapping, 0)
-	persistEntries := make([]store.DeviceListEntry, 0, len(jidsToSync))
-	cli.Log.Infof("usync_resolve path=prewarm_warm to_sync=%d cached=%d chunks=%d cap=%d context=%s paced=true delay_ms=%d",
-		len(jidsToSync), len(devices), len(chunks), maxUsyncUsersPerQuery, usyncContext, chunkDelay.Milliseconds())
-
-	var chunkErr error
-	for i, chunk := range chunks {
-		if i > 0 && chunkDelay > 0 {
-			select {
-			case <-ctx.Done():
-				chunkErr = ctx.Err()
-			case <-time.After(chunkDelay):
-			}
-			if chunkErr != nil {
-				break
-			}
-		}
-		// Per-IQ size/context are logged by usync() (usync_send); the ~delay_ms
-		// gap between these chunks shows the pacing in the timestamps.
-		list, err := cli.usync(ctx, chunk, "query", usyncContext, []waBinary.Node{
-			{Tag: "devices", Attrs: waBinary.Attrs{"version": "2"}},
-		})
-		if err != nil {
-			chunkErr = fmt.Errorf("prewarm usync chunk %d/%d: %w", i+1, len(chunks), err)
-			break
-		}
-		cli.userDevicesCacheLock.Lock()
-		cli.foldUsyncDevices(list, &devices, jidsWithDevices, &lidMappings, &persistEntries)
-		cli.userDevicesCacheLock.Unlock()
-	}
-
-	// Persist harvested LID→PN mappings even on a partial/cancelled run — the
-	// chunks that succeeded resolved real mappings, and dropping them on a chunk
-	// error (the old early-return) just forces the next warm to re-harvest them.
-	if len(lidMappings) > 0 {
-		if err := cli.Store.LIDs.PutManyLIDMappings(ctx, lidMappings); err != nil {
-			cli.Log.Errorf("Failed to store LID mappings from paced usync: %v", err)
-		}
-	}
-
-	// Write-through resolved device lists (best-effort; outside the per-chunk lock).
-	// Persisted even on a partial/cancelled run — the chunks that resolved are real.
-	cli.persistDeviceLists(ctx, persistEntries)
-
-	if chunkErr != nil {
-		return devices, chunkErr
-	}
-
-	// Fire the no-device callback for JIDs that returned 0 devices, matching
-	// GetUserDevices — otherwise warming would stop marking not-on-WhatsApp
-	// contacts inactive (a silent regression vs the send path). Only after a
-	// fully resolved run — a partial run hasn't attempted every JID.
-	if cli.OnNoDeviceContacts != nil {
-		var noDeviceJIDs []types.JID
-		for _, jid := range jidsToSync {
-			if !jidsWithDevices[jid.ToNonAD()] {
-				noDeviceJIDs = append(noDeviceJIDs, jid)
-			}
-		}
-		if len(noDeviceJIDs) > 0 {
-			go cli.tryOnNoDeviceContacts(ctx, noDeviceJIDs)
-		}
-	}
-	return devices, nil
 }
 
 // tryOnNoDeviceContacts invokes the OnNoDeviceContacts callback under panic recovery and
