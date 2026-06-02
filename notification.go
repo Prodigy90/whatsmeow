@@ -181,6 +181,10 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 		newParticipantHash := participantListHashV2(cached.devices)
 		if newParticipantHash == deviceHash {
 			cli.Log.Debugf("%s's device list hash changed from %s to %s (%s). New hash matches", from, cachedParticipantHash, deviceHash, child.Tag)
+			// Keep dhash consistent with the patched device list before write-back: it
+			// is persisted below (DHash: final.dhash); a stale dhash would mislead the
+			// future delta-usync consumer.
+			cached.dhash = newParticipantHash
 			cli.userDevicesCache[from] = cached
 		} else {
 			cli.Log.Warnf("%s's device list hash changed from %s to %s (%s). New hash doesn't match (%s)", from, cachedParticipantHash, deviceHash, child.Tag, newParticipantHash)
@@ -190,6 +194,7 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 			newLIDParticipantHash := participantListHashV2(cachedLID.devices)
 			if newLIDParticipantHash == deviceLIDHash {
 				cli.Log.Debugf("%s's device list hash changed from %s to %s (%s). New hash matches", fromLID, cachedLIDHash, deviceLIDHash, child.Tag)
+				cachedLID.dhash = newLIDParticipantHash
 				cli.userDevicesCache[*fromLID] = cachedLID
 			} else {
 				cli.Log.Warnf("%s's device list hash changed from %s to %s (%s). New hash doesn't match (%s)", fromLID, cachedLIDHash, deviceLIDHash, child.Tag, newLIDParticipantHash)
