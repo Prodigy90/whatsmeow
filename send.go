@@ -499,6 +499,8 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			cli.userDevicesCacheLock.Lock()
 			delete(cli.userDevicesCache, to)
 			cli.userDevicesCacheLock.Unlock()
+			// Mirror the eviction to the persistent store (best-effort; nil-safe).
+			cli.forgetDeviceList(ctx, to)
 		}
 	}
 	return

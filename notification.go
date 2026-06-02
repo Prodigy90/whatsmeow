@@ -124,8 +124,21 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 	}
 	cached, ok := cli.userDevicesCache[from]
 	if !ok {
-		cli.Log.Debugf("No device list cached for %s, ignoring device list notification", from)
-		return
+		// Gotcha fix (B1a persistence): with a restart-surviving device cache, the
+		// list may be in the persistent store but not yet loaded into memory. Load
+		// it so the add/remove patch below applies and the persisted row stays
+		// consistent. No-op when no store is wired.
+		lookup := []types.JID{from}
+		if fromLID != nil {
+			lookup = append(lookup, *fromLID)
+		}
+		var scratch []types.JID
+		cli.loadDeviceListsFromStoreLocked(ctx, lookup, &scratch)
+		cached, ok = cli.userDevicesCache[from]
+		if !ok {
+			cli.Log.Debugf("No device list cached for %s, ignoring device list notification", from)
+			return
+		}
 	}
 	var cachedLID deviceCache
 	var cachedLIDHash string
@@ -182,6 +195,22 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 				cli.Log.Warnf("%s's device list hash changed from %s to %s (%s). New hash doesn't match (%s)", fromLID, cachedLIDHash, deviceLIDHash, child.Tag, newLIDParticipantHash)
 				delete(cli.userDevicesCache, *fromLID)
 			}
+		}
+	}
+
+	// Mirror the post-notification in-memory state to the persistent store so a
+	// stale row can't outlive the invalidation. Best-effort; runs under the cache
+	// lock (device notifications are infrequent — one bounded DB op is fine here).
+	if final, stillCached := cli.userDevicesCache[from]; stillCached && len(final.devices) > 0 {
+		cli.persistDeviceLists(ctx, []store.DeviceListEntry{{TheirJID: from.ToNonAD(), Devices: final.devices, DHash: final.dhash}})
+	} else {
+		cli.forgetDeviceList(ctx, from)
+	}
+	if fromLID != nil {
+		if finalLID, stillCached := cli.userDevicesCache[*fromLID]; stillCached && len(finalLID.devices) > 0 {
+			cli.persistDeviceLists(ctx, []store.DeviceListEntry{{TheirJID: fromLID.ToNonAD(), Devices: finalLID.devices, DHash: finalLID.dhash}})
+		} else {
+			cli.forgetDeviceList(ctx, *fromLID)
 		}
 	}
 }

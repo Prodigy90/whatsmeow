@@ -500,6 +500,13 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 			jidsToSync = append(jidsToSync, jid)
 		}
 	}
+
+	// Read-on-miss: resolve cache-miss JIDs from the persistent device-list store
+	// (which survives restarts) before falling back to a cold usync. Runs under the
+	// cache lock — consistent with the PutManyLIDMappings DB write below, and far
+	// cheaper than the usync it avoids. No-op when no store is wired (in-memory only).
+	jidsToSync = cli.loadDeviceListsFromStoreLocked(ctx, jidsToSync, &devices)
+
 	if len(jidsToSync) > 0 {
 		jidsWithDevices := make(map[types.JID]bool, len(jidsToSync))
 
@@ -519,7 +526,8 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 		if err != nil {
 			return nil, err
 		}
-		cli.foldUsyncDevices(list, &devices, jidsWithDevices, &lidMappings)
+		persistEntries := make([]store.DeviceListEntry, 0, len(jidsToSync))
+		cli.foldUsyncDevices(list, &devices, jidsWithDevices, &lidMappings, &persistEntries)
 
 		if len(lidMappings) > 0 {
 			if err := cli.Store.LIDs.PutManyLIDMappings(ctx, lidMappings); err != nil {
@@ -528,6 +536,10 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 				cli.Log.Infof("GetUserDevices: harvested %d LID mappings from %d input JIDs", len(lidMappings), len(jidsToSync))
 			}
 		}
+
+		// Write-through the freshly resolved device lists to the persistent store
+		// (best-effort; under the cache lock, like the LID write above).
+		cli.persistDeviceLists(ctx, persistEntries)
 
 		// Fire callback for JIDs that returned 0 devices (not on WhatsApp)
 		if cli.OnNoDeviceContacts != nil {
@@ -557,23 +569,104 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 // foldUsyncDevices parses one usync device-query response <list> into the device
 // cache and the given accumulators (devices resolved, JIDs that returned ≥1
 // device, harvested PN→LID mappings). The caller MUST hold userDevicesCacheLock.
-func (cli *Client) foldUsyncDevices(list *waBinary.Node, devices *[]types.JID, jidsWithDevices map[types.JID]bool, lidMappings *[]store.LIDMapping) {
+func (cli *Client) foldUsyncDevices(list *waBinary.Node, devices *[]types.JID, jidsWithDevices map[types.JID]bool, lidMappings *[]store.LIDMapping, persist *[]store.DeviceListEntry) {
 	for _, user := range list.GetChildren() {
 		jid, jidOK := user.Attrs["jid"].(types.JID)
 		if user.Tag != "user" || !jidOK {
 			continue
 		}
 		userDevices := parseDeviceList(jid, user.GetChildByTag("devices"))
-		cli.userDevicesCache[jid] = deviceCache{devices: userDevices, dhash: participantListHashV2(userDevices)}
+		dhash := participantListHashV2(userDevices)
+		cli.userDevicesCache[jid] = deviceCache{devices: userDevices, dhash: dhash}
 		*devices = append(*devices, userDevices...)
 		if len(userDevices) > 0 {
 			jidsWithDevices[jid.ToNonAD()] = true
+			// Collect for write-through to the optional persistent device cache.
+			// Skip 0-device results — the read path treats them as a miss anyway.
+			if persist != nil {
+				*persist = append(*persist, store.DeviceListEntry{TheirJID: jid.ToNonAD(), Devices: userDevices, DHash: dhash})
+			}
 		}
 		lidTag := user.GetChildByTag("lid")
 		if lid := lidTag.AttrGetter().OptionalJIDOrEmpty("val"); !lid.IsEmpty() {
 			*lidMappings = append(*lidMappings, store.LIDMapping{PN: jid, LID: lid})
 		}
 	}
+}
+
+// persistDeviceLists write-throughs resolved device-list entries to the optional
+// DeviceListStore. Best-effort cache maintenance: nil-safe, only logs on error,
+// never alters the caller's control flow. Does NOT touch userDevicesCache, so it
+// is safe to call with or without userDevicesCacheLock held.
+func (cli *Client) persistDeviceLists(ctx context.Context, entries []store.DeviceListEntry) {
+	if len(entries) == 0 || cli.Store == nil || cli.Store.DeviceLists == nil {
+		return
+	}
+	ourJID := cli.getOwnID()
+	if ourJID.IsEmpty() {
+		return
+	}
+	if err := cli.Store.DeviceLists.PutManyDeviceLists(ctx, ourJID.ToNonAD(), entries); err != nil {
+		cli.Log.Warnf("Failed to persist %d device-list cache entries: %v", len(entries), err)
+	} else {
+		cli.Log.Infof("device_cache_write: persisted %d device-list entries to store", len(entries))
+	}
+}
+
+// forgetDeviceList drops one contact's persisted device list when the in-memory
+// cache is invalidated (device-list-changed notification, send-time phash
+// mismatch) so a stale row can't outlive the eviction. Best-effort + nil-safe;
+// does NOT touch userDevicesCache.
+func (cli *Client) forgetDeviceList(ctx context.Context, theirJID types.JID) {
+	if cli.Store == nil || cli.Store.DeviceLists == nil {
+		return
+	}
+	ourJID := cli.getOwnID()
+	if ourJID.IsEmpty() {
+		return
+	}
+	if err := cli.Store.DeviceLists.DeleteDeviceList(ctx, ourJID.ToNonAD(), theirJID.ToNonAD()); err != nil {
+		cli.Log.Warnf("Failed to delete device-list cache for %s: %v", theirJID, err)
+	} else {
+		cli.Log.Infof("device_cache_invalidate: dropped persisted device list for %s", theirJID)
+	}
+}
+
+// loadDeviceListsFromStoreLocked resolves cache-miss JIDs from the optional
+// persistent store, folding hits into the in-memory cache and the devices
+// accumulator, and returns the JIDs that are STILL unresolved (and need a usync).
+// The CALLER MUST HOLD userDevicesCacheLock. Nil-safe: returns jidsToSync
+// unchanged when no store is wired or on any store error — a send/lookup must
+// never fail because the cache backend is unavailable.
+func (cli *Client) loadDeviceListsFromStoreLocked(ctx context.Context, jidsToSync []types.JID, devices *[]types.JID) []types.JID {
+	if len(jidsToSync) == 0 || cli.Store == nil || cli.Store.DeviceLists == nil {
+		return jidsToSync
+	}
+	ourJID := cli.getOwnID()
+	if ourJID.IsEmpty() {
+		return jidsToSync
+	}
+	found, err := cli.Store.DeviceLists.GetManyDeviceLists(ctx, ourJID.ToNonAD(), jidsToSync)
+	if err != nil {
+		cli.Log.Warnf("Failed to load %d device lists from cache store: %v", len(jidsToSync), err)
+		return jidsToSync
+	}
+	if len(found) == 0 {
+		return jidsToSync
+	}
+	remaining := make([]types.JID, 0, len(jidsToSync))
+	for _, jid := range jidsToSync {
+		if entry, ok := found[jid.ToNonAD()]; ok && len(entry.Devices) > 0 {
+			cli.userDevicesCache[jid] = deviceCache{devices: entry.Devices, dhash: entry.DHash}
+			*devices = append(*devices, entry.Devices...)
+		} else {
+			remaining = append(remaining, jid)
+		}
+	}
+	if applied := len(jidsToSync) - len(remaining); applied > 0 {
+		cli.Log.Infof("device_cache_read: resolved %d/%d device lists from persistent store, %d still need usync", applied, len(jidsToSync), len(remaining))
+	}
+	return remaining
 }
 
 // GetUserDevicesPaced resolves device lists like GetUserDevices, but issues the
@@ -609,6 +702,8 @@ func (cli *Client) GetUserDevicesPaced(ctx context.Context, jids []types.JID, ch
 			skipped++ // Messenger/bot/legacy JIDs aren't warmed by the pre-warmer
 		}
 	}
+	// Read-on-miss from the persistent device-list store before any paced usync.
+	jidsToSync = cli.loadDeviceListsFromStoreLocked(ctx, jidsToSync, &devices)
 	cli.userDevicesCacheLock.Unlock()
 	if skipped > 0 {
 		cli.Log.Debugf("GetUserDevicesPaced: skipped %d non-PN/LID JIDs (Messenger/bot/legacy not warmed)", skipped)
@@ -617,6 +712,7 @@ func (cli *Client) GetUserDevicesPaced(ctx context.Context, jids []types.JID, ch
 	chunks := usyncDeviceChunks(jidsToSync)
 	jidsWithDevices := make(map[types.JID]bool, len(jidsToSync))
 	lidMappings := make([]store.LIDMapping, 0)
+	persistEntries := make([]store.DeviceListEntry, 0, len(jidsToSync))
 	cli.Log.Infof("usync_resolve path=prewarm_warm to_sync=%d cached=%d chunks=%d cap=%d context=%s paced=true delay_ms=%d",
 		len(jidsToSync), len(devices), len(chunks), maxUsyncUsersPerQuery, usyncContext, chunkDelay.Milliseconds())
 
@@ -642,7 +738,7 @@ func (cli *Client) GetUserDevicesPaced(ctx context.Context, jids []types.JID, ch
 			break
 		}
 		cli.userDevicesCacheLock.Lock()
-		cli.foldUsyncDevices(list, &devices, jidsWithDevices, &lidMappings)
+		cli.foldUsyncDevices(list, &devices, jidsWithDevices, &lidMappings, &persistEntries)
 		cli.userDevicesCacheLock.Unlock()
 	}
 
@@ -654,6 +750,10 @@ func (cli *Client) GetUserDevicesPaced(ctx context.Context, jids []types.JID, ch
 			cli.Log.Errorf("Failed to store LID mappings from paced usync: %v", err)
 		}
 	}
+
+	// Write-through resolved device lists (best-effort; outside the per-chunk lock).
+	// Persisted even on a partial/cancelled run — the chunks that resolved are real.
+	cli.persistDeviceLists(ctx, persistEntries)
 
 	if chunkErr != nil {
 		return devices, chunkErr
