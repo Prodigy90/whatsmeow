@@ -193,6 +193,37 @@ type LIDStore interface {
 	GetManyLIDsForPNs(ctx context.Context, pns []types.JID) (map[types.JID]types.JID, error)
 }
 
+// DeviceListEntry is one persisted per-contact device-list cache row (the result
+// of a usync device query). Devices are AD-JIDs; an entry is never persisted with
+// an empty device list.
+type DeviceListEntry struct {
+	TheirJID types.JID
+	Devices  []types.JID
+	DHash    string
+}
+
+// DeviceListStore optionally persists the per-contact device-list (usync) cache,
+// which whatsmeow otherwise keeps in memory only (Client.userDevicesCache) and
+// loses on restart. It is OPTIONAL: Device.DeviceLists may be nil, in which case
+// device-list caching stays purely in-memory (unchanged behaviour). All methods are
+// scoped by ourJID (the local account's non-AD JID) so a single backing table can
+// hold multiple accounts. Implementations must persist only non-empty device lists
+// and should treat every operation as best-effort cache maintenance — a failure
+// must not break a send or a device lookup (callers log and continue).
+type DeviceListStore interface {
+	// PutManyDeviceLists upserts a batch of device-list entries for ourJID.
+	PutManyDeviceLists(ctx context.Context, ourJID types.JID, entries []DeviceListEntry) error
+	// GetManyDeviceLists bulk-reads cached device lists for the given contacts. The
+	// returned map is keyed by the non-AD theirJID and contains only found rows.
+	GetManyDeviceLists(ctx context.Context, ourJID types.JID, theirJIDs []types.JID) (map[types.JID]DeviceListEntry, error)
+	// DeleteDeviceList drops one contact's cached device list (invalidation).
+	DeleteDeviceList(ctx context.Context, ourJID, theirJID types.JID) error
+	// DeleteAllDeviceLists drops every cached device list for the account. Called
+	// when whatsmeow's own device store is wiped (logout/unlink), so the cache
+	// follows the same lifecycle: it survives disconnects but not a logout.
+	DeleteAllDeviceLists(ctx context.Context, ourJID types.JID) error
+}
+
 type AllSessionSpecificStores interface {
 	IdentityStore
 	SessionStore
@@ -253,7 +284,11 @@ type Device struct {
 	NCTSalt       NCTSaltStore
 	EventBuffer   EventBuffer
 	LIDs          LIDStore
-	Container     DeviceContainer
+	// DeviceLists optionally persists the in-memory userDevicesCache across
+	// restarts. nil = in-memory only (default). Wired by the app, NOT by
+	// SetAllStores — see DeviceListStore.
+	DeviceLists DeviceListStore
+	Container   DeviceContainer
 }
 
 func (device *Device) GetJID() types.JID {
