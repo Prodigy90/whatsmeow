@@ -2,13 +2,11 @@ package whatsmeow
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	"go.mau.fi/libsignal/keys/prekey"
 	"go.mau.fi/libsignal/session"
-	"go.mau.fi/libsignal/signalerror"
 
 	"go.mau.fi/whatsmeow/types"
 )
@@ -85,20 +83,13 @@ func (cli *Client) PrewarmSessions(ctx context.Context, jids []types.JID, opts P
 
 	contactChunks := usyncDeviceChunks(jids)
 	for i, chunk := range contactChunks {
-		if i > 0 && opts.UsyncChunkDelay > 0 {
-			select {
-			case <-ctx.Done():
-				return res, ctx.Err()
-			case <-time.After(opts.UsyncChunkDelay):
-			}
-		}
-
 		// 1. Resolve this chunk's device list — ≤500 contacts → a single usync IQ in
 		//    `background` context (cache / persistent-store hits resolve without an
 		//    IQ). getUserDevices write-throughs the result to the persistent device
 		//    cache. A usync error means the server rejected us (the 403 precursor) —
-		//    abort rather than keep hammering.
-		chunkDevices, err := cli.getUserDevices(ctx, chunk, usyncContext)
+		//    abort rather than keep hammering. hitWire reports whether this chunk
+		//    actually issued a usync IQ versus resolving entirely from the cache.
+		chunkDevices, hitWire, err := cli.getUserDevicesReportingSync(ctx, chunk, usyncContext)
 		if err != nil {
 			cli.Log.Warnf("Prewarm: usync failed for chunk %d/%d: %v", i+1, len(contactChunks), err)
 			return res, fmt.Errorf("prewarm: failed to resolve device list: %w", err)
@@ -107,29 +98,49 @@ func (cli *Client) PrewarmSessions(ctx context.Context, jids []types.JID, opts P
 
 		// 2. Warm this chunk's sessions in a chunk-scoped cache (flushed + dropped
 		//    inside warmDeviceChunk). Best-effort: a chunk-level error is logged and
-		//    counted; only ctx cancellation aborts the whole pass.
+		//    counted; only ctx cancellation aborts the whole pass. A bump in res.Batches
+		//    means this chunk issued a prekey-fetch IQ (it had cold devices to acquire).
+		batchesBefore := res.Batches
 		if err := cli.warmDeviceChunk(ctx, chunkDevices, opts, res); err != nil {
 			if ctx.Err() != nil {
 				return res, ctx.Err()
 			}
 			cli.Log.Warnf("Prewarm: warm failed for chunk %d/%d: %v", i+1, len(contactChunks), err)
 		}
+		issuedPrekeyIQ := res.Batches > batchesBefore
 
 		// 3. Drop this chunk's device lists from the in-memory cache — they're in the
 		//    persistent store now and reload on demand at send time (read-on-miss),
 		//    so in-memory device state stays flat across the whole warm. No-op without
 		//    a persistent store wired.
 		cli.evictDeviceCache(chunk)
+
+		// 4. Pace before the next chunk ONLY when this one emitted wire traffic — a
+		//    usync IQ and/or a prekey-fetch batch. The delay exists solely to space out
+		//    those acquisition bursts (the 403 precursor); a chunk that resolved entirely
+		//    from the device cache and warmed nothing emits no IQ, so sleeping after it is
+		//    pure dead time. Pre-fix, an all-warm pre_send pass slept ~6s per ≤500
+		//    contacts (e.g. 96s for an 8.3k roster) while warming nothing, stalling the
+		//    send it was supposed to accelerate.
+		didWire := hitWire || issuedPrekeyIQ
+		if didWire && opts.UsyncChunkDelay > 0 && i < len(contactChunks)-1 {
+			select {
+			case <-ctx.Done():
+				return res, ctx.Err()
+			case <-time.After(opts.UsyncChunkDelay):
+			}
+		}
 	}
 	return res, nil
 }
 
-// warmDeviceChunk establishes Signal sessions for one chunk's devices using a
-// chunk-scoped session/identity cache (attached to a context that is GC'd when this
-// function returns), fetches prekeys for the cold ones in paced sub-batches, and
-// flushes the warmed sessions to the store. It holds only this chunk's data and
-// accumulates counts into res. Mirrors the encryption-identity / session-build path
-// of encryptMessageForDevices.
+// warmDeviceChunk establishes Signal sessions for one chunk's devices. It first does
+// an existence-only check (ContainsManySessions) to count already-warm devices without
+// loading their session blobs, then loads full session/identity state into a chunk-scoped
+// cache (GC'd when this function returns) for the COLD delta only, fetches prekeys for
+// those in paced sub-batches, and flushes the warmed sessions to the store. It holds only
+// the cold subset's data and accumulates counts into res. Mirrors the encryption-identity
+// / session-build path of encryptMessageForDevices.
 func (cli *Client) warmDeviceChunk(ctx context.Context, devices []types.JID, opts PrewarmOpts, res *PrewarmResult) error {
 	if len(devices) == 0 {
 		return nil
@@ -137,83 +148,70 @@ func (cli *Client) warmDeviceChunk(ctx context.Context, devices []types.JID, opt
 	ownJID := cli.getOwnID()
 	ownLID := cli.getOwnLID()
 
-	// Resolve PN→LID encryption identities so we warm the SAME signal address the
-	// send will later look up (mirrors encryptMessageForDevices).
-	var pnDevices []types.JID
-	for _, jid := range devices {
-		if jid.Server == types.DefaultUserServer {
-			pnDevices = append(pnDevices, jid)
-		}
-	}
-	var lidMappings map[types.JID]types.JID
-	if len(pnDevices) > 0 {
-		var err error
-		lidMappings, err = cli.Store.LIDs.GetManyLIDsForPNs(ctx, pnDevices)
-		if err != nil {
-			return fmt.Errorf("fetch LID mappings: %w", err)
-		}
-	}
-
-	// encIdentity maps each device's original JID → its encryption identity (the LID
-	// when a mapping exists, else the device JID itself). The prekey bundle is fetched
-	// keyed by the original JID but the session is stored under the encryption
-	// identity's signal address — identical to the send.
-	encIdentity := make(map[types.JID]types.JID, len(devices))
-	addrToOriginal := make(map[string]types.JID, len(devices))
-	sessionAddresses := make([]string, 0, len(devices))
-	pnToLIDMappings := make(map[types.JID]types.JID)
+	// Drop our own primary JID/LID — we never hold a Signal session to our own primary
+	// device, so there's nothing to warm there (the send skips it at encrypt time too).
+	// Own companion devices stay in, mirroring the send's DSM fan-out to them.
+	targets := make([]types.JID, 0, len(devices))
 	for _, jid := range devices {
 		if jid == ownJID || jid == ownLID {
-			continue // skip the primary own JID/LID; the send skips them too
+			continue
 		}
-		identity := jid
-		if jid.Server == types.DefaultUserServer {
-			if lid, ok := lidMappings[jid]; ok && !lid.IsEmpty() {
-				identity = lid
-				pnToLIDMappings[jid] = lid
-			}
-		}
-		encIdentity[jid] = identity
-		addr := identity.SignalAddress().String()
-		sessionAddresses = append(sessionAddresses, addr)
-		addrToOriginal[addr] = jid
+		targets = append(targets, jid)
 	}
-	if len(sessionAddresses) == 0 {
+	if len(targets) == 0 {
 		return nil
 	}
 
-	// Migrate any PN-addressed sessions/identities to their LID address before the
-	// cached lookup, exactly as the send does — else a device whose session still
-	// lives under the old PN address reads as cold under its LID address and gets a
-	// redundant prekey re-fetch. Mirrors encryptMessageForDevices.
-	if len(pnToLIDMappings) > 0 {
-		if mErr := cli.Store.Sessions.MigrateManyPNsToLIDs(ctx, pnToLIDMappings); mErr != nil {
-			cli.Log.Errorf("Prewarm: failed to migrate PN→LID sessions: %v", mErr)
-		}
+	// Resolve PN→LID encryption identities + migrate, via the shared helper, so we warm
+	// the SAME signal address the send will later encrypt to. encIdentity maps each
+	// original device JID → its encryption identity; the prekey bundle is fetched keyed by
+	// the original JID but the session is stored under the encryption identity's address.
+	resolution, err := cli.resolveEncryptionIdentities(ctx, targets)
+	if err != nil {
+		return err
+	}
+	encIdentity := resolution.encIdentity
+	sessionAddresses := resolution.sessionAddresses
+	addrToOriginal := resolution.addrToJID
+
+	// Existence-only check: which of this chunk's addresses already have a session.
+	// This selects their_id alone — it does NOT pull or deserialize the session blobs,
+	// which is the dominant DB-egress + GC cost of an all-warm pass (we'd otherwise load
+	// every blob just to count it and throw it away). Only the cold delta below gets its
+	// full session/identity state loaded.
+	existing, err := cli.Store.Sessions.ContainsManySessions(ctx, sessionAddresses)
+	if err != nil {
+		return fmt.Errorf("check existing sessions: %w", err)
 	}
 
-	// Bulk-load this chunk's existing sessions + identities into a chunk-scoped cache.
-	// The cache lives in cctx and is reclaimed when this function returns.
-	existingSessions, cctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
-	if err != nil {
-		return fmt.Errorf("load existing sessions: %w", err)
-	}
-	cctx, err = cli.Store.WithCachedIdentities(cctx, sessionAddresses)
-	if err != nil {
-		return fmt.Errorf("load existing identities: %w", err)
-	}
-
-	// coldOriginals are the original JIDs in this chunk we still need bundles for.
+	// Split warm (count) from cold (need bundles). Iterate sessionAddresses for a
+	// deterministic order; absent-from-map means no stored session → cold.
+	var coldAddrs []string
 	var coldOriginals []types.JID
-	for addr, exists := range existingSessions {
-		if exists {
+	for _, addr := range sessionAddresses {
+		if existing[addr] {
 			res.AlreadyWarm++
 			continue
 		}
+		coldAddrs = append(coldAddrs, addr)
 		coldOriginals = append(coldOriginals, addrToOriginal[addr])
 	}
 	if len(coldOriginals) == 0 {
-		return nil // nothing cold in this chunk; caches unchanged, nothing to flush
+		return nil // whole chunk already warm — no blobs loaded, nothing to flush
+	}
+
+	// Load full session + identity state for the COLD delta only, into a chunk-scoped
+	// cache reclaimed when this function returns. For a cold device the session record is
+	// empty; the cache is the write buffer ProcessBundle populates and flushPrewarmCaches
+	// persists. In steady state the cold set is a small fraction of the chunk, so this
+	// loads far fewer blobs than the old load-everything-then-count shape.
+	_, cctx, err := cli.Store.WithCachedSessions(ctx, coldAddrs)
+	if err != nil {
+		return fmt.Errorf("load cold sessions: %w", err)
+	}
+	cctx, err = cli.Store.WithCachedIdentities(cctx, coldAddrs)
+	if err != nil {
+		return fmt.Errorf("load cold identities: %w", err)
 	}
 
 	// warmed is counted locally and folded into res.Warmed only after a successful
@@ -274,22 +272,11 @@ func (cli *Client) warmDeviceChunk(ctx context.Context, devices []types.JID, opt
 
 // processPrewarmBundle establishes (and persists into the cached session store)
 // a Signal session from a fetched prekey bundle, WITHOUT encrypting or sending
-// anything. Mirrors the bundle branch of encryptMessageForDevice, including the
-// AutoTrustIdentity clear-and-retry.
+// anything. It shares the bundle-processing core (processPreKeyBundle) with the send
+// path, so the AutoTrustIdentity clear-and-retry behaviour stays identical to a real send.
 func (cli *Client) processPrewarmBundle(ctx context.Context, to types.JID, bundle *prekey.Bundle) error {
 	builder := session.NewBuilderFromSignal(cli.Store, to.SignalAddress(), pbSerializer)
-	err := builder.ProcessBundle(ctx, bundle)
-	if cli.AutoTrustIdentity && errors.Is(err, signalerror.ErrUntrustedIdentity) {
-		cli.Log.Warnf("Prewarm: untrusted identity for %s, clearing and retrying", to)
-		if clearErr := cli.clearUntrustedIdentity(ctx, to); clearErr != nil {
-			return fmt.Errorf("failed to clear untrusted identity: %w", clearErr)
-		}
-		err = builder.ProcessBundle(ctx, bundle)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to process prekey bundle: %w", err)
-	}
-	return nil
+	return cli.processPreKeyBundle(ctx, builder, to, bundle)
 }
 
 // flushPrewarmCaches writes the cached sessions and identities accumulated

@@ -32,6 +32,13 @@ type IdentityStore interface {
 type SessionStore interface {
 	GetSession(ctx context.Context, address string) ([]byte, error)
 	HasSession(ctx context.Context, address string) (bool, error)
+	// ContainsManySessions reports which of the given addresses already have a stored
+	// session, WITHOUT loading or deserializing the session blobs. The returned map
+	// contains an entry (value true) only for addresses that exist; absent addresses
+	// are cold. Used by the pre-warmer to count already-warm devices cheaply — the
+	// dominant cost of an all-warm pass is otherwise pulling every session blob from
+	// the DB just to discard it.
+	ContainsManySessions(ctx context.Context, addresses []string) (map[string]bool, error)
 	GetManySessions(ctx context.Context, addresses []string) (map[string][]byte, error)
 	PutSession(ctx context.Context, address string, session []byte) error
 	PutManySessions(ctx context.Context, sessions map[string][]byte) error

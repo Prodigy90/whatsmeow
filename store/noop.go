@@ -77,6 +77,10 @@ func (n *NoopStore) HasSession(ctx context.Context, address string) (bool, error
 	return false, n.Error
 }
 
+func (n *NoopStore) ContainsManySessions(ctx context.Context, addresses []string) (map[string]bool, error) {
+	return nil, n.Error
+}
+
 func (n *NoopStore) GetManySessions(ctx context.Context, addresses []string) (map[string][]byte, error) {
 	return nil, n.Error
 }

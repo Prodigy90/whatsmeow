@@ -1320,6 +1320,70 @@ func (cli *Client) makeDeviceIdentityNode() waBinary.Node {
 	}
 }
 
+// encIdentityResolution is the output of resolveEncryptionIdentities for a set of device
+// JIDs: the encryption identity each maps to (its LID when the PN has a LID partner, else
+// the JID itself), the parallel list of signal-address strings (input order), and the
+// reverse address→original-JID lookup. The send and the pre-warmer both consume it so a
+// device is warmed under exactly the address the send will later encrypt to.
+type encIdentityResolution struct {
+	encIdentity      map[types.JID]types.JID // original device JID → encryption identity
+	sessionAddresses []string                // signal addresses, in input order
+	addrToJID        map[string]types.JID    // signal address → original device JID
+}
+
+// resolveEncryptionIdentities maps each device to its Signal encryption identity, builds
+// the parallel session-address list + reverse lookup, and batch-migrates any PN-addressed
+// sessions/identities/sender-keys to their LID address (6 queries instead of 6*N) so a
+// later cache lookup under the LID address hits instead of reading cold. Shared by the
+// send path and the pre-warmer — keeping the LID resolution + migration in one place is
+// what guarantees prewarm warms the same address the send encrypts to (a drift here would
+// reintroduce the cold prekey burst). Callers decide which devices to include (e.g. the
+// pre-warmer drops its own primary JID/LID first).
+func (cli *Client) resolveEncryptionIdentities(ctx context.Context, devices []types.JID) (*encIdentityResolution, error) {
+	var pnDevices []types.JID
+	for _, jid := range devices {
+		if jid.Server == types.DefaultUserServer {
+			pnDevices = append(pnDevices, jid)
+		}
+	}
+	var lidMappings map[types.JID]types.JID
+	if len(pnDevices) > 0 {
+		var err error
+		lidMappings, err = cli.Store.LIDs.GetManyLIDsForPNs(ctx, pnDevices)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch LID mappings: %w", err)
+		}
+	}
+
+	out := &encIdentityResolution{
+		encIdentity:      make(map[types.JID]types.JID, len(devices)),
+		sessionAddresses: make([]string, 0, len(devices)),
+		addrToJID:        make(map[string]types.JID, len(devices)),
+	}
+	pnToLIDMappings := make(map[types.JID]types.JID)
+	for _, jid := range devices {
+		encryptionIdentity := jid
+		if jid.Server == types.DefaultUserServer {
+			// TODO query LID from server for missing entries
+			if lidForPN, ok := lidMappings[jid]; ok && !lidForPN.IsEmpty() {
+				pnToLIDMappings[jid] = lidForPN
+				encryptionIdentity = lidForPN
+			}
+		}
+		out.encIdentity[jid] = encryptionIdentity
+		addr := encryptionIdentity.SignalAddress().String()
+		out.sessionAddresses = append(out.sessionAddresses, addr)
+		out.addrToJID[addr] = jid
+	}
+
+	if len(pnToLIDMappings) > 0 {
+		if err := cli.Store.Sessions.MigrateManyPNsToLIDs(ctx, pnToLIDMappings); err != nil {
+			cli.Log.Errorf("Failed to batch migrate signal store PN→LID: %v", err)
+		}
+	}
+	return out, nil
+}
+
 func (cli *Client) encryptMessageForDevices(
 	ctx context.Context,
 	allDevices []types.JID,
@@ -1332,44 +1396,13 @@ func (cli *Client) encryptMessageForDevices(
 	includeIdentity := false
 	participantNodes := make([]waBinary.Node, 0, len(allDevices))
 
-	var pnDevices []types.JID
-	for _, jid := range allDevices {
-		if jid.Server == types.DefaultUserServer {
-			pnDevices = append(pnDevices, jid)
-		}
-	}
-	lidMappings, err := cli.Store.LIDs.GetManyLIDsForPNs(ctx, pnDevices)
+	resolution, err := cli.resolveEncryptionIdentities(ctx, allDevices)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to fetch LID mappings: %w", err)
+		return nil, false, err
 	}
-
-	encryptionIdentities := make(map[types.JID]types.JID, len(allDevices))
-	sessionAddressToJID := make(map[string]types.JID, len(allDevices))
-	sessionAddresses := make([]string, 0, len(allDevices))
-	// Collect PN→LID mappings for batch migration
-	pnToLIDMappings := make(map[types.JID]types.JID)
-	for _, jid := range allDevices {
-		encryptionIdentity := jid
-		if jid.Server == types.DefaultUserServer {
-			// TODO query LID from server for missing entries
-			if lidForPN, ok := lidMappings[jid]; ok && !lidForPN.IsEmpty() {
-				pnToLIDMappings[jid] = lidForPN
-				encryptionIdentity = lidForPN
-			}
-		}
-		encryptionIdentities[jid] = encryptionIdentity
-		addr := encryptionIdentity.SignalAddress().String()
-		sessionAddresses = append(sessionAddresses, addr)
-		sessionAddressToJID[addr] = jid
-	}
-
-	// Batch migrate all PN→LID sessions/identities/sender keys (6 queries instead of 6*N)
-	if len(pnToLIDMappings) > 0 {
-		err = cli.Store.Sessions.MigrateManyPNsToLIDs(ctx, pnToLIDMappings)
-		if err != nil {
-			cli.Log.Errorf("Failed to batch migrate signal store PN→LID: %v", err)
-		}
-	}
+	encryptionIdentities := resolution.encIdentity
+	sessionAddressToJID := resolution.addrToJID
+	sessionAddresses := resolution.sessionAddresses
 
 	prefetchStart := time.Now()
 	existingSessions, ctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
@@ -1519,6 +1552,25 @@ func copyAttrs(from, to waBinary.Attrs) {
 	}
 }
 
+// processPreKeyBundle establishes a Signal session from a fetched prekey bundle using
+// the given builder, including the AutoTrustIdentity clear-and-retry. Shared by the send
+// (encryptMessageForDevice's bundle branch) and the pre-warmer (processPrewarmBundle) so
+// the untrusted-identity recovery can't drift between the two paths.
+func (cli *Client) processPreKeyBundle(ctx context.Context, builder *session.Builder, to types.JID, bundle *prekey.Bundle) error {
+	err := builder.ProcessBundle(ctx, bundle)
+	if cli.AutoTrustIdentity && errors.Is(err, signalerror.ErrUntrustedIdentity) {
+		cli.Log.Warnf("Got %v error while trying to process prekey bundle for %s, clearing stored identity and retrying", err, to)
+		if clearErr := cli.clearUntrustedIdentity(ctx, to); clearErr != nil {
+			return fmt.Errorf("failed to clear untrusted identity: %w", clearErr)
+		}
+		err = builder.ProcessBundle(ctx, bundle)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to process prekey bundle: %w", err)
+	}
+	return nil
+}
+
 func (cli *Client) encryptMessageForDevice(
 	ctx context.Context,
 	plaintext []byte,
@@ -1530,17 +1582,8 @@ func (cli *Client) encryptMessageForDevice(
 	builder := session.NewBuilderFromSignal(cli.Store, to.SignalAddress(), pbSerializer)
 	if bundle != nil {
 		cli.Log.Debugf("Processing prekey bundle for %s", to)
-		err := builder.ProcessBundle(ctx, bundle)
-		if cli.AutoTrustIdentity && errors.Is(err, signalerror.ErrUntrustedIdentity) {
-			cli.Log.Warnf("Got %v error while trying to process prekey bundle for %s, clearing stored identity and retrying", err, to)
-			err = cli.clearUntrustedIdentity(ctx, to)
-			if err != nil {
-				return nil, false, fmt.Errorf("failed to clear untrusted identity: %w", err)
-			}
-			err = builder.ProcessBundle(ctx, bundle)
-		}
-		if err != nil {
-			return nil, false, fmt.Errorf("failed to process prekey bundle: %w", err)
+		if err := cli.processPreKeyBundle(ctx, builder, to, bundle); err != nil {
+			return nil, false, err
 		}
 	} else {
 		sessionExists, checked := existingSessions[to.SignalAddress().String()]

@@ -486,8 +486,20 @@ func (cli *Client) GetUserDevices(ctx context.Context, jids []types.JID) ([]type
 // use "message"; the streaming pre-warmer passes "background" to mirror native WA
 // Web's roster-warm context.
 func (cli *Client) getUserDevices(ctx context.Context, jids []types.JID, usyncContext string) ([]types.JID, error) {
+	devices, _, err := cli.getUserDevicesReportingSync(ctx, jids, usyncContext)
+	return devices, err
+}
+
+// getUserDevicesReportingSync is getUserDevices plus a flag reporting whether the
+// call issued a usync (or FB device) IQ over the wire, versus resolving every input
+// JID from the in-memory / persistent device cache. The streaming pre-warmer uses
+// this to skip its inter-chunk pacing delay for cache-only chunks: that delay exists
+// solely to space out wire usync bursts (the 403 precursor), so a chunk that emits
+// no IQ needs no pacing. Without this an all-warm pre-send pass slept ~6s per ≤500
+// contacts (e.g. 96s for an 8.3k-contact roster) while warming nothing.
+func (cli *Client) getUserDevicesReportingSync(ctx context.Context, jids []types.JID, usyncContext string) (resolved []types.JID, hitWire bool, err error) {
 	if cli == nil {
-		return nil, ErrClientIsNil
+		return nil, false, ErrClientIsNil
 	}
 	cli.userDevicesCacheLock.Lock()
 	defer cli.userDevicesCacheLock.Unlock()
@@ -514,6 +526,7 @@ func (cli *Client) getUserDevices(ctx context.Context, jids []types.JID, usyncCo
 	jidsToSync = cli.loadDeviceListsFromStoreLocked(ctx, jidsToSync, &devices)
 
 	if len(jidsToSync) > 0 {
+		hitWire = true
 		jidsWithDevices := make(map[types.JID]bool, len(jidsToSync))
 
 		// Harvest LID mappings inline with the device query. WA returns `<lid val="...@lid">`
@@ -526,11 +539,11 @@ func (cli *Client) getUserDevices(ctx context.Context, jids []types.JID, usyncCo
 
 		// usync() caps each IQ at ≤maxUsyncUsersPerQuery and merges the chunked
 		// response, so jidsToSync may be any size here.
-		list, err := cli.usync(ctx, jidsToSync, "query", usyncContext, []waBinary.Node{
+		list, syncErr := cli.usync(ctx, jidsToSync, "query", usyncContext, []waBinary.Node{
 			{Tag: "devices", Attrs: waBinary.Attrs{"version": "2"}},
 		})
-		if err != nil {
-			return nil, err
+		if syncErr != nil {
+			return nil, hitWire, syncErr
 		}
 		persistEntries := make([]store.DeviceListEntry, 0, len(jidsToSync))
 		cli.foldUsyncDevices(list, &devices, jidsWithDevices, &lidMappings, &persistEntries)
@@ -562,14 +575,15 @@ func (cli *Client) getUserDevices(ctx context.Context, jids []types.JID, usyncCo
 	}
 
 	if len(fbJIDsToSync) > 0 {
-		userDevices, err := cli.getFBIDDevices(ctx, fbJIDsToSync)
-		if err != nil {
-			return nil, err
+		hitWire = true
+		userDevices, fbErr := cli.getFBIDDevices(ctx, fbJIDsToSync)
+		if fbErr != nil {
+			return nil, hitWire, fbErr
 		}
 		devices = append(devices, userDevices...)
 	}
 
-	return devices, nil
+	return devices, hitWire, nil
 }
 
 // foldUsyncDevices parses one usync device-query response <list> into the device
