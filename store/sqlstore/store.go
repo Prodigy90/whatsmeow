@@ -74,11 +74,11 @@ const (
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity) VALUES ($1, $2, $3)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
-	deleteAllIdentitiesQuery          = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2`
-	deleteIdentityQuery               = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
-	getIdentityQuery                  = `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
-	getManyIdentitiesQueryPostgres    = `SELECT their_id, identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id = ANY($2)`
-	getManyIdentitiesQueryGeneric     = `SELECT their_id, identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id IN (%s)`
+	deleteAllIdentitiesQuery       = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2`
+	deleteIdentityQuery            = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
+	getIdentityQuery               = `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
+	getManyIdentitiesQueryPostgres = `SELECT their_id, identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id = ANY($2)`
+	getManyIdentitiesQueryGeneric  = `SELECT their_id, identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id IN (%s)`
 )
 
 func (s *SQLStore) PutIdentity(ctx context.Context, address string, key [32]byte) error {
@@ -108,25 +108,32 @@ var identityScanner = dbutil.ConvertRowFn[addressIdentityTuple](func(row dbutil.
 	return
 })
 
+// queryByAddresses runs a "... WHERE our_jid=$1 AND their_id IN (addresses)" query,
+// binding the address set as a single Postgres array ($2 = ANY) when available and
+// falling back to generated positional placeholders otherwise. pgQuery must reference
+// the address set as $2; genericQuery must contain a single %s where the placeholder
+// list ($2,$3,…) is interpolated. Callers pass the resulting (rows, err) straight into
+// their row scanner. Shared by the GetMany*/ContainsMany* readers.
+func (s *SQLStore) queryByAddresses(ctx context.Context, pgQuery, genericQuery string, addresses []string) (dbutil.Rows, error) {
+	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
+		return s.db.Query(ctx, pgQuery, s.JID, PostgresArrayWrapper(addresses))
+	}
+	args := make([]any, len(addresses)+1)
+	placeholders := make([]string, len(addresses))
+	args[0] = s.JID
+	for i, addr := range addresses {
+		args[i+1] = addr
+		placeholders[i] = fmt.Sprintf("$%d", i+2)
+	}
+	return s.db.Query(ctx, fmt.Sprintf(genericQuery, strings.Join(placeholders, ",")), args...)
+}
+
 func (s *SQLStore) GetManyIdentities(ctx context.Context, addresses []string) (map[string]*[32]byte, error) {
 	if len(addresses) == 0 {
 		return nil, nil
 	}
 
-	var rows dbutil.Rows
-	var err error
-	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
-		rows, err = s.db.Query(ctx, getManyIdentitiesQueryPostgres, s.JID, PostgresArrayWrapper(addresses))
-	} else {
-		args := make([]any, len(addresses)+1)
-		placeholders := make([]string, len(addresses))
-		args[0] = s.JID
-		for i, addr := range addresses {
-			args[i+1] = addr
-			placeholders[i] = fmt.Sprintf("$%d", i+2)
-		}
-		rows, err = s.db.Query(ctx, fmt.Sprintf(getManyIdentitiesQueryGeneric, strings.Join(placeholders, ",")), args...)
-	}
+	rows, err := s.queryByAddresses(ctx, getManyIdentitiesQueryPostgres, getManyIdentitiesQueryGeneric, addresses)
 	result := make(map[string]*[32]byte, len(addresses))
 	for _, addr := range addresses {
 		result[addr] = nil
@@ -195,7 +202,14 @@ const (
 	hasSessionQuery             = `SELECT true FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id=$2`
 	getManySessionQueryPostgres = `SELECT their_id, session FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id = ANY($2)`
 	getManySessionQueryGeneric  = `SELECT their_id, session FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id IN (%s)`
-	putSessionQuery             = `
+	// containsManySessions selects only their_id (no session blob) — an existence check
+	// that avoids transferring/deserializing session bytes. The `session IS NOT NULL`
+	// guard matches WithCachedSessions' found semantics (found = non-null session bytes),
+	// so the pre-warmer's warm/cold split is identical to what the send path computes — a
+	// NULL-session row is treated as cold by both, not skipped here and re-fetched there.
+	containsManySessionsQueryPostgres = `SELECT their_id FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id = ANY($2) AND session IS NOT NULL`
+	containsManySessionsQueryGeneric  = `SELECT their_id FROM whatsmeow_sessions WHERE our_jid=$1 AND session IS NOT NULL AND their_id IN (%s)`
+	putSessionQuery                   = `
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session) VALUES ($1, $2, $3)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
@@ -270,26 +284,39 @@ func (s *SQLStore) GetManySessions(ctx context.Context, addresses []string) (map
 		return nil, nil
 	}
 
-	var rows dbutil.Rows
-	var err error
-	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
-		rows, err = s.db.Query(ctx, getManySessionQueryPostgres, s.JID, PostgresArrayWrapper(addresses))
-	} else {
-		args := make([]any, len(addresses)+1)
-		placeholders := make([]string, len(addresses))
-		args[0] = s.JID
-		for i, addr := range addresses {
-			args[i+1] = addr
-			placeholders[i] = fmt.Sprintf("$%d", i+2)
-		}
-		rows, err = s.db.Query(ctx, fmt.Sprintf(getManySessionQueryGeneric, strings.Join(placeholders, ",")), args...)
-	}
+	rows, err := s.queryByAddresses(ctx, getManySessionQueryPostgres, getManySessionQueryGeneric, addresses)
 	result := make(map[string][]byte, len(addresses))
 	for _, addr := range addresses {
 		result[addr] = nil
 	}
 	err = sessionScanner.NewRowIter(rows, err).Iter(func(tuple addressSessionTuple) (bool, error) {
 		result[tuple.Address] = tuple.Session
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+var sessionAddressScanner = dbutil.ConvertRowFn[string](func(row dbutil.Scannable) (out string, err error) {
+	err = row.Scan(&out)
+	return
+})
+
+// ContainsManySessions returns the subset of addresses that have a stored session,
+// selecting only their_id so no session blob is transferred or deserialized. The
+// returned map holds an entry (value true) for each existing address; addresses with
+// no session are simply absent.
+func (s *SQLStore) ContainsManySessions(ctx context.Context, addresses []string) (map[string]bool, error) {
+	if len(addresses) == 0 {
+		return nil, nil
+	}
+
+	rows, err := s.queryByAddresses(ctx, containsManySessionsQueryPostgres, containsManySessionsQueryGeneric, addresses)
+	result := make(map[string]bool, len(addresses))
+	err = sessionAddressScanner.NewRowIter(rows, err).Iter(func(addr string) (bool, error) {
+		result[addr] = true
 		return true, nil
 	})
 	if err != nil {
