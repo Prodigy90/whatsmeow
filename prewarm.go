@@ -26,6 +26,21 @@ type PrewarmOpts struct {
 	// UsyncContext is the usync `context` attr used for device resolution.
 	// Defaults to "background" (WA Web's roster-warm context) when empty.
 	UsyncContext string
+	// MinPaceDevices is the smallest number of prekey bundles a chunk must actually
+	// fetch before its post-chunk UsyncChunkDelay applies. The pacing delay exists to
+	// space out genuine acquisition *bursts* (the 403 precursor); a chunk that fetched
+	// only a handful of stragglers — e.g. retrying 1-2 permanently-dead companion
+	// devices on an otherwise all-warm roster — is not a burst and isn't worth a
+	// multi-second sleep. Zero keeps the legacy behaviour (pace on any prekey IQ),
+	// which made a couple of dead devices add ~6s/chunk of dead sleep to every pass.
+	MinPaceDevices int
+	// SkipDevice, when non-nil, is consulted for each COLD device before its prekey
+	// bundle is fetched; returning true drops the device from the pass entirely (no
+	// IQ, counted in Skipped rather than Warmed/Failed/AlreadyWarm). The app wires
+	// this to a TTL'd negative cache of devices whose bundle recently came back empty,
+	// so permanently-dead devices stop re-issuing a prekey IQ (and dragging in the
+	// pacing delay) on every pass — they are re-probed once the cache entry expires.
+	SkipDevice func(jid types.JID) bool
 }
 
 // PrewarmResult reports what a PrewarmSessions pass accomplished.
@@ -34,7 +49,15 @@ type PrewarmResult struct {
 	AlreadyWarm int // devices that already had a Signal session
 	Warmed      int // devices for which a new session was established
 	Failed      int // devices we tried to warm but couldn't (fetch/bundle/process error)
+	Skipped     int // cold devices skipped via opts.SkipDevice (negative-cached failures)
+	Fetched     int // cold devices we issued a prekey fetch for (the per-chunk burst size)
 	Batches     int // number of prekey-fetch batches issued
+	// FailedDevices lists the device JIDs whose bundle fetch/processing failed this
+	// pass. The app negative-caches these (TTL'd) so a permanently-dead device isn't
+	// re-fetched on every pass. NOTE: a failure here is per-DEVICE, not per-contact —
+	// the contact is on WhatsApp (usync resolved this device) and their other devices
+	// still receive sends, so this must NOT be promoted to contact-level inactivity.
+	FailedDevices []types.JID
 }
 
 // PrewarmSessions establishes Signal sessions for the given JIDs ahead of time,
@@ -98,16 +121,17 @@ func (cli *Client) PrewarmSessions(ctx context.Context, jids []types.JID, opts P
 
 		// 2. Warm this chunk's sessions in a chunk-scoped cache (flushed + dropped
 		//    inside warmDeviceChunk). Best-effort: a chunk-level error is logged and
-		//    counted; only ctx cancellation aborts the whole pass. A bump in res.Batches
-		//    means this chunk issued a prekey-fetch IQ (it had cold devices to acquire).
-		batchesBefore := res.Batches
+		//    counted; only ctx cancellation aborts the whole pass. res.Fetched counts
+		//    the prekey bundles this chunk requested (incremented at fetch time, so the
+		//    burst size is correct even if the chunk's flush later fails).
+		fetchedBefore := res.Fetched
 		if err := cli.warmDeviceChunk(ctx, chunkDevices, opts, res); err != nil {
 			if ctx.Err() != nil {
 				return res, ctx.Err()
 			}
 			cli.Log.Warnf("Prewarm: warm failed for chunk %d/%d: %v", i+1, len(contactChunks), err)
 		}
-		issuedPrekeyIQ := res.Batches > batchesBefore
+		prekeysFetched := res.Fetched - fetchedBefore
 
 		// 3. Drop this chunk's device lists from the in-memory cache — they're in the
 		//    persistent store now and reload on demand at send time (read-on-miss),
@@ -115,14 +139,17 @@ func (cli *Client) PrewarmSessions(ctx context.Context, jids []types.JID, opts P
 		//    a persistent store wired.
 		cli.evictDeviceCache(chunk)
 
-		// 4. Pace before the next chunk ONLY when this one emitted wire traffic — a
-		//    usync IQ and/or a prekey-fetch batch. The delay exists solely to space out
-		//    those acquisition bursts (the 403 precursor); a chunk that resolved entirely
-		//    from the device cache and warmed nothing emits no IQ, so sleeping after it is
-		//    pure dead time. Pre-fix, an all-warm pre_send pass slept ~6s per ≤500
-		//    contacts (e.g. 96s for an 8.3k roster) while warming nothing, stalling the
-		//    send it was supposed to accelerate.
-		didWire := hitWire || issuedPrekeyIQ
+		// 4. Pace before the next chunk ONLY when this one emitted a real acquisition
+		//    burst worth spacing out (the 403 precursor): a usync IQ (hitWire), or a
+		//    prekey fetch covering >= MinPaceDevices bundles. A chunk that resolved
+		//    entirely from the device cache and warmed nothing — or only retried a
+		//    couple of stragglers/dead devices — emits no burst, so sleeping after it
+		//    is pure dead time. Pre-fix, an all-warm pre_send pass slept ~6s per ≤500
+		//    contacts (e.g. 96s for an 8.3k roster); the hitWire gate fixed the no-IQ
+		//    case but a handful of permanently-failing devices still kept 2 chunks
+		//    "dirty" forever, costing ~12s of dead sleep on every send.
+		prekeyBurst := prekeysFetched > 0 && prekeysFetched >= opts.MinPaceDevices
+		didWire := hitWire || prekeyBurst
 		if didWire && opts.UsyncChunkDelay > 0 && i < len(contactChunks)-1 {
 			select {
 			case <-ctx.Done():
@@ -185,7 +212,11 @@ func (cli *Client) warmDeviceChunk(ctx context.Context, devices []types.JID, opt
 	}
 
 	// Split warm (count) from cold (need bundles). Iterate sessionAddresses for a
-	// deterministic order; absent-from-map means no stored session → cold.
+	// deterministic order; absent-from-map means no stored session → cold. A cold
+	// device the caller's negative cache flags (SkipDevice) is dropped here — it
+	// recently failed its bundle fetch, so re-issuing a prekey IQ for it would warm
+	// nothing AND drag in the inter-chunk pacing delay; it's re-probed once the cache
+	// entry expires.
 	var coldAddrs []string
 	var coldOriginals []types.JID
 	for _, addr := range sessionAddresses {
@@ -193,11 +224,16 @@ func (cli *Client) warmDeviceChunk(ctx context.Context, devices []types.JID, opt
 			res.AlreadyWarm++
 			continue
 		}
+		original := addrToOriginal[addr]
+		if opts.SkipDevice != nil && opts.SkipDevice(original) {
+			res.Skipped++
+			continue
+		}
 		coldAddrs = append(coldAddrs, addr)
-		coldOriginals = append(coldOriginals, addrToOriginal[addr])
+		coldOriginals = append(coldOriginals, original)
 	}
 	if len(coldOriginals) == 0 {
-		return nil // whole chunk already warm — no blobs loaded, nothing to flush
+		return nil // whole chunk already warm/skipped — no blobs loaded, nothing to flush
 	}
 
 	// Load full session + identity state for the COLD delta only, into a chunk-scoped
@@ -228,17 +264,35 @@ func (cli *Client) warmDeviceChunk(ctx context.Context, devices []types.JID, opt
 		}
 		batch := coldOriginals[start:end]
 		res.Batches++
+		// Fetched is the wire-acquisition burst size, counted at request time (not
+		// flush time) so the pacing decision is robust to a later flush failure and
+		// to whole-batch transport errors.
+		res.Fetched += len(batch)
 
-		bundles := cli.fetchPreKeysNoError(cctx, batch)
-		for _, original := range batch {
-			bundle := bundles[original]
-			if bundle == nil {
-				res.Failed++ // no bundle returned (offline device, error, etc.)
-				continue
-			}
-			if err := cli.processPrewarmBundle(cctx, encIdentity[original], bundle); err != nil {
+		// Fetch the batch directly (not via fetchPreKeysNoError) so we can tell a
+		// whole-batch transport failure apart from a per-device one. fetchPreKeysNoError
+		// collapses both into a nil bundle; negative-caching on that signal would, on a
+		// single transient IQ error (timeout/disconnect/503/empty response), blacklist an
+		// entire cold batch of LIVE devices for the cache TTL — forcing the very cold
+		// prekey burst on the next send that this pre-warm exists to prevent. So: on a
+		// batch error, count the failures for reporting but DON'T negative-cache any of
+		// them (they get re-tried next pass); only per-device failures are cached.
+		bundlesResp, err := cli.fetchPreKeys(cctx, batch)
+		if err != nil {
+			cli.Log.Warnf("Prewarm: prekey batch fetch failed for %d devices (not caching — likely transient): %v", len(batch), err)
+			res.Failed += len(batch)
+			continue
+		}
+		toWarm, toCache := classifyPrewarmBatch(batch, bundlesResp)
+		for _, original := range toCache {
+			res.Failed++
+			res.FailedDevices = append(res.FailedDevices, original)
+		}
+		for _, original := range toWarm {
+			if err := cli.processPrewarmBundle(cctx, encIdentity[original], bundlesResp[original].bundle); err != nil {
 				cli.Log.Warnf("Prewarm: failed to establish session for %s: %v", encIdentity[original], err)
 				res.Failed++
+				res.FailedDevices = append(res.FailedDevices, original)
 				continue
 			}
 			warmed++
@@ -268,6 +322,28 @@ func (cli *Client) warmDeviceChunk(ctx context.Context, devices []types.JID, opt
 	}
 	res.Warmed += warmed
 	return nil
+}
+
+// classifyPrewarmBatch splits a SUCCESSFULLY-fetched prekey batch into devices that
+// have a usable bundle (warm) and per-device failures to negative-cache (cache): a
+// device omitted from the response, returning a parse error, or with a nil bundle has
+// no fetchable session right now, so caching + re-probing it after the TTL is correct.
+//
+// The caller MUST handle a whole-BATCH fetch error (transport timeout/disconnect/503/
+// empty response) separately and NOT call this with that batch: those devices are
+// transient failures, not dead, and blacklisting them would force a cold prekey burst
+// on the next send. This split is the crux of the ban-safety fix, so it's a pure,
+// unit-tested function rather than an inline loop.
+func classifyPrewarmBatch(batch []types.JID, resp map[types.JID]preKeyResp) (warm, cache []types.JID) {
+	for _, original := range batch {
+		r, ok := resp[original]
+		if !ok || r.err != nil || r.bundle == nil {
+			cache = append(cache, original)
+			continue
+		}
+		warm = append(warm, original)
+	}
+	return warm, cache
 }
 
 // processPrewarmBundle establishes (and persists into the cached session store)
