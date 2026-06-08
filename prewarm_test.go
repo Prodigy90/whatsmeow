@@ -2,8 +2,10 @@ package whatsmeow
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"go.mau.fi/libsignal/keys/prekey"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"go.mau.fi/whatsmeow/store"
@@ -97,6 +99,125 @@ func TestWarmDeviceChunk_AllWarmSkipsBlobLoad(t *testing.T) {
 	}
 	if sessions.getManyCalled {
 		t.Fatal("GetManySessions called on an all-warm chunk — blob load not skipped")
+	}
+}
+
+// coldSessions reports every queried address as cold (no stored session) and records
+// whether the blob-loading GetManySessions was ever called.
+type coldSessions struct {
+	*store.NoopStore
+	getManyCalled bool
+}
+
+func (c *coldSessions) ContainsManySessions(ctx context.Context, addresses []string) (map[string]bool, error) {
+	return map[string]bool{}, nil // all cold
+}
+
+func (c *coldSessions) GetManySessions(ctx context.Context, addresses []string) (map[string][]byte, error) {
+	c.getManyCalled = true
+	return c.NoopStore.GetManySessions(ctx, addresses)
+}
+
+// TestWarmDeviceChunk_SkipDeviceSkipsColdDevices locks in the negative-cache hook: a
+// COLD device the caller's SkipDevice predicate rejects is dropped from the pass — it's
+// counted in Skipped, never has its prekey bundle fetched, and the cold-blob load is
+// skipped entirely. This is what stops a couple of permanently-dead companion devices
+// from re-issuing a prekey IQ (and dragging in the inter-chunk pacing delay) on every
+// otherwise-all-warm pass.
+func TestWarmDeviceChunk_SkipDeviceSkipsColdDevices(t *testing.T) {
+	ownJID := types.JID{User: "10000000000", Server: types.DefaultUserServer}
+	sessions := &coldSessions{NoopStore: &store.NoopStore{}}
+	dev := &store.Device{
+		ID:         &ownJID,
+		Sessions:   sessions,
+		LIDs:       &store.NoopStore{},
+		Identities: &store.NoopStore{},
+	}
+	cli := &Client{Store: dev, Log: waLog.Noop}
+
+	user := types.JID{User: "2348011112222", Server: types.DefaultUserServer}
+	d0 := user
+	d0.Device = 0
+	d1 := user
+	d1.Device = 1
+	devices := []types.JID{d0, d1}
+
+	var asked []types.JID
+	res := &PrewarmResult{}
+	opts := PrewarmOpts{BatchSize: 5000, SkipDevice: func(j types.JID) bool {
+		asked = append(asked, j)
+		return true
+	}}
+	if err := cli.warmDeviceChunk(context.Background(), devices, opts, res); err != nil {
+		t.Fatalf("warmDeviceChunk: %v", err)
+	}
+	if res.Skipped != len(devices) {
+		t.Fatalf("Skipped = %d, want %d", res.Skipped, len(devices))
+	}
+	if res.Warmed != 0 || res.Failed != 0 || res.Batches != 0 {
+		t.Fatalf("expected no fetch work, got Warmed=%d Failed=%d Batches=%d", res.Warmed, res.Failed, res.Batches)
+	}
+	if len(res.FailedDevices) != 0 {
+		t.Fatalf("skipped devices must not be reported as failed, got %v", res.FailedDevices)
+	}
+	if sessions.getManyCalled {
+		t.Fatal("GetManySessions called despite all devices skipped — cold blob load not avoided")
+	}
+	if len(asked) != len(devices) {
+		t.Fatalf("SkipDevice consulted %d times, want %d", len(asked), len(devices))
+	}
+}
+
+// TestClassifyPrewarmBatch is the regression guard for the ban-safety fix: only
+// per-device failures (omitted from the response, parse error, or nil bundle) may be
+// negative-cached; a device with a usable bundle warms. The whole-BATCH transport-error
+// case never reaches this function — warmDeviceChunk handles a non-nil fetchPreKeys error
+// before calling classifyPrewarmBatch, counting the batch as Failed without caching any
+// device — so classify only ever sees a successfully-fetched response map.
+func TestClassifyPrewarmBatch(t *testing.T) {
+	good := types.JID{User: "111", Server: types.DefaultUserServer}    // valid bundle → warm
+	missing := types.JID{User: "222", Server: types.DefaultUserServer} // absent from resp → cache
+	errd := types.JID{User: "333", Server: types.DefaultUserServer}    // per-device error → cache
+	nilB := types.JID{User: "444", Server: types.DefaultUserServer}    // present, nil bundle → cache
+	batch := []types.JID{good, missing, errd, nilB}
+
+	resp := map[types.JID]preKeyResp{
+		good: {bundle: &prekey.Bundle{}},
+		errd: {err: errors.New("boom")},
+		nilB: {bundle: nil},
+		// `missing` deliberately absent from the map.
+	}
+
+	warm, cache := classifyPrewarmBatch(batch, resp)
+
+	if len(warm) != 1 || warm[0] != good {
+		t.Fatalf("warm = %v, want [%v]", warm, good)
+	}
+	wantCache := map[types.JID]bool{missing: true, errd: true, nilB: true}
+	if len(cache) != len(wantCache) {
+		t.Fatalf("cache = %v, want the 3 per-device failures", cache)
+	}
+	for _, c := range cache {
+		if !wantCache[c] {
+			t.Errorf("unexpected device negative-cached: %v", c)
+		}
+	}
+}
+
+// TestClassifyPrewarmBatch_AllGoodCachesNothing confirms a fully-successful batch
+// negative-caches nothing (the steady-state cold-warm path).
+func TestClassifyPrewarmBatch_AllGoodCachesNothing(t *testing.T) {
+	a := types.JID{User: "111", Server: types.DefaultUserServer}
+	b := types.JID{User: "222", Server: types.DefaultUserServer}
+	batch := []types.JID{a, b}
+	resp := map[types.JID]preKeyResp{a: {bundle: &prekey.Bundle{}}, b: {bundle: &prekey.Bundle{}}}
+
+	warm, cache := classifyPrewarmBatch(batch, resp)
+	if len(warm) != 2 {
+		t.Fatalf("warm = %v, want both devices", warm)
+	}
+	if len(cache) != 0 {
+		t.Fatalf("cache = %v, want nothing cached on an all-good batch", cache)
 	}
 }
 
