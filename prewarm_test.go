@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"go.mau.fi/libsignal/keys/prekey"
@@ -236,5 +237,38 @@ func TestGetUserDevicesReportingSync_EmptyInput(t *testing.T) {
 	}
 	if len(devices) != 0 {
 		t.Fatalf("expected 0 devices, got %d", len(devices))
+	}
+}
+
+// TestIsDefinitivePrekeyRejection locks in the classifier that decides whether a failed
+// prekey-fetch IQ may be negative-cached. A per-target refusal (406 not-acceptable / 404
+// item-not-found) means the server won't ever serve that JID's bundle → cache it so a
+// permanently-dead companion device stops re-probing every send. A transient failure
+// (timeout / disconnect / 5xx / rate-limit / empty response) says nothing about the device,
+// so caching it would blacklist live devices and force the cold prekey burst the pre-warm
+// exists to prevent. Errors are checked through fetchPreKeys's `%w` wrapping.
+func TestIsDefinitivePrekeyRejection(t *testing.T) {
+	wrap := func(err error) error { return fmt.Errorf("failed to send prekey request: %w", err) }
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"406 not-acceptable (dead device)", wrap(&IQError{Code: 406, Text: "not-acceptable"}), true},
+		{"404 item-not-found", wrap(&IQError{Code: 404, Text: "item-not-found"}), true},
+		{"bare 406 unwrapped", &IQError{Code: 406, Text: "not-acceptable"}, true},
+		{"403 forbidden (account-level, not per-device)", wrap(&IQError{Code: 403, Text: "forbidden"}), false},
+		{"429 rate-overlimit (transient)", wrap(&IQError{Code: 429, Text: "rate-overlimit"}), false},
+		{"503 service-unavailable (transient)", wrap(&IQError{Code: 503, Text: "service-unavailable"}), false},
+		{"IQ timed out (transient)", wrap(ErrIQTimedOut), false},
+		{"empty-response error (transient)", errors.New("got empty response to prekey request"), false},
+		{"nil error", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDefinitivePrekeyRejection(tt.err); got != tt.want {
+				t.Fatalf("isDefinitivePrekeyRejection(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
