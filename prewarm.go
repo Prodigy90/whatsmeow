@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,6 +11,15 @@ import (
 
 	"go.mau.fi/whatsmeow/types"
 )
+
+// prewarmMaxIsolate caps how many devices a single definitively-rejected prekey batch
+// is re-probed one-by-one to isolate the culprit(s). A single unacceptable JID (e.g. a
+// dead companion device → 406) poisons the whole batch IQ, so we re-fetch each device
+// alone to cache only the ones the server actually refuses. The cap bounds the extra IQ
+// traffic on this ban-sensitive path: a larger rejected batch is left un-cached (rare —
+// in steady state a chunk's cold set is 1-2 stragglers — and safer than an IQ storm or
+// blacklisting a big cold batch of possibly-live devices).
+const prewarmMaxIsolate = 16
 
 // PrewarmOpts configures a PrewarmSessions pass.
 type PrewarmOpts struct {
@@ -58,6 +68,15 @@ type PrewarmResult struct {
 	// the contact is on WhatsApp (usync resolved this device) and their other devices
 	// still receive sends, so this must NOT be promoted to contact-level inactivity.
 	FailedDevices []types.JID
+
+	// Timing breakdown, summed across all chunks — diagnostic only, for sizing where a
+	// pass spends its wall-clock (e.g. an all-warm pass that still costs seconds: is it
+	// the per-chunk DB walk, the usync IQs, the pace sleeps, or a few dead-device fetches?).
+	ResolveDevices  time.Duration // getUserDevicesReportingSync (usync IQ + device-cache reads)
+	ResolveIdentity time.Duration // resolveEncryptionIdentities (LID lookups + PN→LID migrate)
+	ContainsCheck   time.Duration // ContainsManySessions existence checks
+	PrekeyFetch     time.Duration // fetchPreKeys IQ round-trips (incl. failed + isolation probes)
+	PaceSleep       time.Duration // UsyncChunkDelay inter-chunk sleeps
 }
 
 // PrewarmSessions establishes Signal sessions for the given JIDs ahead of time,
@@ -112,7 +131,9 @@ func (cli *Client) PrewarmSessions(ctx context.Context, jids []types.JID, opts P
 		//    cache. A usync error means the server rejected us (the 403 precursor) —
 		//    abort rather than keep hammering. hitWire reports whether this chunk
 		//    actually issued a usync IQ versus resolving entirely from the cache.
+		resolveStart := time.Now()
 		chunkDevices, hitWire, err := cli.getUserDevicesReportingSync(ctx, chunk, usyncContext)
+		res.ResolveDevices += time.Since(resolveStart)
 		if err != nil {
 			cli.Log.Warnf("Prewarm: usync failed for chunk %d/%d: %v", i+1, len(contactChunks), err)
 			return res, fmt.Errorf("prewarm: failed to resolve device list: %w", err)
@@ -151,10 +172,13 @@ func (cli *Client) PrewarmSessions(ctx context.Context, jids []types.JID, opts P
 		prekeyBurst := prekeysFetched > 0 && prekeysFetched >= opts.MinPaceDevices
 		didWire := hitWire || prekeyBurst
 		if didWire && opts.UsyncChunkDelay > 0 && i < len(contactChunks)-1 {
+			paceStart := time.Now()
 			select {
 			case <-ctx.Done():
+				res.PaceSleep += time.Since(paceStart)
 				return res, ctx.Err()
 			case <-time.After(opts.UsyncChunkDelay):
+				res.PaceSleep += time.Since(paceStart)
 			}
 		}
 	}
@@ -193,7 +217,9 @@ func (cli *Client) warmDeviceChunk(ctx context.Context, devices []types.JID, opt
 	// the SAME signal address the send will later encrypt to. encIdentity maps each
 	// original device JID → its encryption identity; the prekey bundle is fetched keyed by
 	// the original JID but the session is stored under the encryption identity's address.
+	identityStart := time.Now()
 	resolution, err := cli.resolveEncryptionIdentities(ctx, targets)
+	res.ResolveIdentity += time.Since(identityStart)
 	if err != nil {
 		return err
 	}
@@ -206,7 +232,9 @@ func (cli *Client) warmDeviceChunk(ctx context.Context, devices []types.JID, opt
 	// which is the dominant DB-egress + GC cost of an all-warm pass (we'd otherwise load
 	// every blob just to count it and throw it away). Only the cold delta below gets its
 	// full session/identity state loaded.
+	containsStart := time.Now()
 	existing, err := cli.Store.Sessions.ContainsManySessions(ctx, sessionAddresses)
+	res.ContainsCheck += time.Since(containsStart)
 	if err != nil {
 		return fmt.Errorf("check existing sessions: %w", err)
 	}
@@ -270,17 +298,36 @@ func (cli *Client) warmDeviceChunk(ctx context.Context, devices []types.JID, opt
 		res.Fetched += len(batch)
 
 		// Fetch the batch directly (not via fetchPreKeysNoError) so we can tell a
-		// whole-batch transport failure apart from a per-device one. fetchPreKeysNoError
-		// collapses both into a nil bundle; negative-caching on that signal would, on a
-		// single transient IQ error (timeout/disconnect/503/empty response), blacklist an
-		// entire cold batch of LIVE devices for the cache TTL — forcing the very cold
-		// prekey burst on the next send that this pre-warm exists to prevent. So: on a
-		// batch error, count the failures for reporting but DON'T negative-cache any of
-		// them (they get re-tried next pass); only per-device failures are cached.
+		// whole-batch IQ error apart from a per-device one. fetchPreKeysNoError collapses
+		// both into a nil bundle; caching on that signal would, on a transient IQ error
+		// (timeout/disconnect/503/empty response), blacklist an entire cold batch of LIVE
+		// devices and force the cold prekey burst this pre-warm exists to prevent. On a
+		// batch error we therefore classify (isDefinitivePrekeyRejection): a DEFINITIVE
+		// per-target rejection (406/404 — a dead JID poisoning the IQ) is isolated and
+		// negative-cached; a TRANSIENT error is only counted, never cached. Per-device
+		// failures from a successful fetch are cached as before.
+		fetchStart := time.Now()
 		bundlesResp, err := cli.fetchPreKeys(cctx, batch)
+		res.PrekeyFetch += time.Since(fetchStart)
 		if err != nil {
-			cli.Log.Warnf("Prewarm: prekey batch fetch failed for %d devices (not caching — likely transient): %v", len(batch), err)
-			res.Failed += len(batch)
+			// A whole-batch IQ error is ambiguous: it can be a TRANSIENT transport failure
+			// (timeout/disconnect/5xx/empty — the connection blipped, the devices are fine)
+			// or a DEFINITIVE per-target rejection (the server refuses a JID — e.g. 406
+			// not-acceptable for a permanently-dead companion device — and a single bad JID
+			// poisons the whole IQ). Negative-caching a transient batch would blacklist live
+			// devices and force the cold prekey burst this pre-warm exists to prevent, so we
+			// cache ONLY definitive rejections; for a multi-device batch we re-probe each
+			// device alone (isolateRejectedDevices) to cache just the real culprit(s) — live
+			// devices stay cold and warm on the next pass, once the dead device is cached/skipped.
+			if isDefinitivePrekeyRejection(err) {
+				for _, dead := range cli.isolateRejectedDevices(cctx, batch, err, res) {
+					res.Failed++
+					res.FailedDevices = append(res.FailedDevices, dead)
+				}
+			} else {
+				cli.Log.Warnf("Prewarm: prekey batch fetch failed for %d devices (not caching — likely transient): %v", len(batch), err)
+				res.Failed += len(batch)
+			}
 			continue
 		}
 		toWarm, toCache := classifyPrewarmBatch(batch, bundlesResp)
@@ -344,6 +391,65 @@ func classifyPrewarmBatch(batch []types.JID, resp map[types.JID]preKeyResp) (war
 		warm = append(warm, original)
 	}
 	return warm, cache
+}
+
+// isDefinitivePrekeyRejection reports whether a prekey-fetch IQ error is a DEFINITIVE
+// per-target rejection — the server refusing the requested JID (406 not-acceptable, 404
+// item-not-found) — as opposed to a TRANSIENT failure (timeout, disconnect, empty response,
+// rate limit, 5xx) that says nothing about the device. Only definitive rejections are safe
+// to negative-cache: blacklisting a device on a transient blip would force the cold prekey
+// burst this pre-warm exists to prevent on the next send. 401/403/429/5xx are connection-
+// or account-level, not per-device, so they are treated as transient here.
+func isDefinitivePrekeyRejection(err error) bool {
+	var iqErr *IQError
+	if !errors.As(err, &iqErr) {
+		return false // timeout/disconnect/empty-response → not an IQ status error → transient
+	}
+	switch iqErr.Code {
+	case 404, 406: // item-not-found, not-acceptable — the server refuses this specific JID
+		return true
+	default:
+		return false
+	}
+}
+
+// isolateRejectedDevices finds which device(s) of a batch whose combined prekey IQ failed
+// with a DEFINITIVE rejection the server actually refuses — a single unacceptable JID fails
+// the whole batch IQ, so the batch error alone can't name the culprit. It returns the device
+// JIDs that themselves return a definitive rejection (or no usable bundle) when probed alone;
+// those are safe to negative-cache. A live device in the poisoned batch returns a bundle on
+// the solo probe and is left cold (it warms on the next pass, once the dead device is skipped).
+//
+// A single-device batch is unambiguous — that device is the rejected one — so it skips the
+// redundant solo probe. Isolation is capped at prewarmMaxIsolate to bound extra IQ traffic on
+// this ban-sensitive path; a larger rejected batch is left un-cached. Solo-probe time is folded
+// into res.PrekeyFetch.
+func (cli *Client) isolateRejectedDevices(ctx context.Context, batch []types.JID, batchErr error, res *PrewarmResult) []types.JID {
+	if len(batch) == 1 {
+		return batch // the single requested JID is unambiguously the one the server refused
+	}
+	if len(batch) > prewarmMaxIsolate {
+		cli.Log.Warnf("Prewarm: definitive prekey rejection for %d devices exceeds the %d isolation cap — not caching any: %v", len(batch), prewarmMaxIsolate, batchErr)
+		return nil
+	}
+	var dead []types.JID
+	for _, jid := range batch {
+		soloStart := time.Now()
+		resp, err := cli.fetchPreKeys(ctx, []types.JID{jid})
+		res.PrekeyFetch += time.Since(soloStart)
+		if err != nil {
+			if isDefinitivePrekeyRejection(err) {
+				dead = append(dead, jid) // the server refuses this JID specifically
+			}
+			// a transient solo failure says nothing — leave cold, re-probe next pass
+			continue
+		}
+		if r, ok := resp[jid]; !ok || r.err != nil || r.bundle == nil {
+			dead = append(dead, jid) // resolved but no usable bundle → dead
+		}
+		// else: live device with a usable bundle → leave cold, warms on the next pass
+	}
+	return dead
 }
 
 // processPrewarmBundle establishes (and persists into the cached session store)
