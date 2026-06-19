@@ -64,12 +64,22 @@ func (cli *Client) addRecentMessage(ctx context.Context, to types.JID, id types.
 			return fmt.Errorf("failed to marshal message for retry store: %w", err)
 		}
 		if buf != nil {
-			err = cli.Store.EventBuffer.AddOutgoingEvent(ctx, to, id, format, buf)
+			// Persisting the outgoing message for retry-receipt handling must not
+			// fail the send just because the caller's context is near its deadline
+			// or the shared DB pool is briefly saturated under concurrent load
+			// (observed under heavy local testing: a reaction's write timed out on
+			// the 5-conn pool while a large status send held connections). This is
+			// a persistence step, so detach from the caller's deadline/cancellation
+			// and give it its own bounded budget — same pattern as the session-cache
+			// flush in send.go. WithoutCancel preserves ctx values.
+			storeCtx, storeCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+			defer storeCancel()
+			err = cli.Store.EventBuffer.AddOutgoingEvent(storeCtx, to, id, format, buf)
 			if err != nil {
 				return fmt.Errorf("failed to add message to retry store: %w", err)
 			}
 			if time.Since(cli.lastRetryStoreClear) > 12*time.Hour {
-				err = cli.Store.EventBuffer.DeleteOldOutgoingEvents(ctx)
+				err = cli.Store.EventBuffer.DeleteOldOutgoingEvents(storeCtx)
 				if err != nil {
 					return fmt.Errorf("failed to clear old messages from retry store: %w", err)
 				}
