@@ -1502,11 +1502,23 @@ func (cli *Client) encryptMessageForDevices(
 	encryptDur := time.Since(encryptStart)
 
 	flushStart := time.Now()
-	err = cli.Store.PutCachedSessions(ctx)
+	// Persisting Signal ratchet state is a cleanup step that must not be
+	// abandoned just because the per-message send context has elapsed. On
+	// CPU-throttled pods (or when this send waited behind messageSendLock for
+	// earlier group sends) the inherited ctx can already be at/near its deadline
+	// by the time we get here — dropping the flush orphans the freshly-ratcheted
+	// sessions, forcing a full pre-key re-exchange on the next send to the same
+	// devices (more CPU, deeper throttle). Detach from the send context's
+	// deadline/cancellation (same pattern as flushPrewarmCaches in prewarm.go)
+	// and give the writes their own bounded budget. WithoutCancel preserves ctx
+	// values, so logging/tracing still works.
+	flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer flushCancel()
+	err = cli.Store.PutCachedSessions(flushCtx)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to save cached sessions: %w", err)
 	}
-	err = cli.Store.PutCachedIdentities(ctx)
+	err = cli.Store.PutCachedIdentities(flushCtx)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to save cached identities: %w", err)
 	}
