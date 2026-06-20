@@ -546,6 +546,100 @@ func (cli *Client) GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, err
 	return infos, nil
 }
 
+// MaxGroupInfoBatchSize is the number of groups requested per
+// per_group_dirty_recovery IQ. WA Web sends exactly 24 per request; we mirror it.
+const MaxGroupInfoBatchSize = 24
+
+// GetGroupInfoBatch fetches metadata for many groups in one round-trip per chunk
+// using WhatsApp's per_group_dirty_recovery_truncatable query — the same bulk
+// recovery mechanism the official WA Web client uses. It is far cheaper than one
+// GetGroupInfo IQ per group and is intended for backfilling groups that
+// GetJoinedGroups (the participating IQ) returned incompletely or omitted. JIDs
+// are chunked into batches of MaxGroupInfoBatchSize and sent sequentially.
+//
+// It is partial-failure tolerant: a chunk whose IQ errors is logged and skipped,
+// and successfully-parsed groups from other chunks are still returned. LID and
+// redacted-phone mappings harvested from participants are persisted just like
+// GetJoinedGroups/GetGroupInfo do.
+func (cli *Client) GetGroupInfoBatch(ctx context.Context, jids []types.JID) ([]*types.GroupInfo, error) {
+	if len(jids) == 0 {
+		return nil, nil
+	}
+
+	infos := make([]*types.GroupInfo, 0, len(jids))
+	var allLIDPairs []store.LIDMapping
+	var allRedactedPhones []store.RedactedPhoneEntry
+	var firstErr error
+
+	for start := 0; start < len(jids); start += MaxGroupInfoBatchSize {
+		end := start + MaxGroupInfoBatchSize
+		if end > len(jids) {
+			end = len(jids)
+		}
+		chunk := jids[start:end]
+
+		groupNodes := make([]waBinary.Node, len(chunk))
+		for i, jid := range chunk {
+			groupNodes[i] = waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"jid": jid}}
+		}
+
+		resp, err := cli.sendGroupIQ(ctx, iqGet, types.GroupServerJID, waBinary.Node{
+			Tag:     "query",
+			Attrs:   waBinary.Attrs{"context": "per_group_dirty_recovery_truncatable"},
+			Content: groupNodes,
+		})
+		if err != nil {
+			cli.Log.Warnf("Group info batch IQ failed for %d groups: %v", len(chunk), err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		groups, ok := resp.GetOptionalChildByTag("groups")
+		if !ok {
+			// Log the raw shape so the response structure can be confirmed live —
+			// the per_group_dirty_recovery response wrapper is not in our captures
+			// (inbound stanzas are binary).
+			cli.Log.Warnf("Group info batch: no <groups> child in response for %d groups; response=%s", len(chunk), resp.XMLString())
+			continue
+		}
+
+		for _, child := range groups.GetChildren() {
+			if child.Tag != "group" {
+				continue
+			}
+			parsed, parseErr := cli.parseGroupNode(&child)
+			if parseErr != nil {
+				cli.Log.Warnf("Error parsing group %s in batch: %v", parsed.JID, parseErr)
+				continue
+			}
+			lidPairs, redactedPhones := cli.cacheGroupInfo(parsed, true)
+			allLIDPairs = append(allLIDPairs, lidPairs...)
+			allRedactedPhones = append(allRedactedPhones, redactedPhones...)
+			infos = append(infos, parsed)
+		}
+	}
+
+	if len(allLIDPairs) > 0 {
+		if err := cli.Store.LIDs.PutManyLIDMappings(ctx, allLIDPairs); err != nil {
+			cli.Log.Warnf("Failed to store LID mappings from group info batch: %v", err)
+		}
+	}
+	if len(allRedactedPhones) > 0 {
+		if err := cli.Store.Contacts.PutManyRedactedPhones(ctx, allRedactedPhones); err != nil {
+			cli.Log.Warnf("Failed to store redacted phones from group info batch: %v", err)
+		}
+	}
+
+	// Only surface an error when we got nothing usable; otherwise return the
+	// partial results (best-effort backfill).
+	if len(infos) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return infos, nil
+}
+
 // GetSubGroups gets the subgroups of the given community.
 func (cli *Client) GetSubGroups(ctx context.Context, community types.JID) ([]*types.GroupLinkTarget, error) {
 	res, err := cli.sendGroupIQ(ctx, iqGet, community, waBinary.Node{Tag: "sub_groups"})
