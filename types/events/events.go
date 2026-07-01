@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"time"
 
+	"go.mau.fi/util/jsontime"
+
 	waBinary "go.mau.fi/whatsmeow/binary"
 	armadillo "go.mau.fi/whatsmeow/proto"
 	"go.mau.fi/whatsmeow/proto/instamadilloTransportPayload"
@@ -55,6 +57,26 @@ type PairError struct {
 	BusinessName string
 	Platform     string
 	Error        error
+}
+
+// PairPasskeyRequest is emitted when the pairing requires a passkey.
+// The client should generate a response and send it using Client.SendPasskeyResponse.
+type PairPasskeyRequest struct {
+	PublicKey *types.WebAuthnPublicKey
+}
+
+// PairPasskeyError is emitted if handling a passkey notification fails.
+type PairPasskeyError struct {
+	Error        error
+	Continuation bool // Whether this was from a continuation notification rather than the initial one
+}
+
+// PairPasskeyConfirmation is emitted after a successful SendPasskeyResponse call.
+// If SkipHandoffUX is false, the user should be shown the code and asked to verify that it matches the one on their phone.
+// After verification if needed, the client should call Client.SendPasskeyConfirmation to finish the pairing process.
+type PairPasskeyConfirmation struct {
+	Code          string
+	SkipHandoffUX bool
 }
 
 // QRScannedWithoutMultidevice is emitted when the pairing QR code is scanned, but the phone didn't have multidevice enabled.
@@ -602,16 +624,24 @@ type BlocklistChange struct {
 	Action BlocklistChangeAction
 }
 
+type MexNotificationData struct {
+	Timestamp time.Time
+	OpName    string
+}
+
 type NewsletterJoin struct {
+	Mex MexNotificationData `json:"-"`
 	types.NewsletterMetadata
 }
 
 type NewsletterLeave struct {
+	Mex  MexNotificationData  `json:"-"`
 	ID   types.JID            `json:"id"`
 	Role types.NewsletterRole `json:"role"`
 }
 
 type NewsletterMuteChange struct {
+	Mex  MexNotificationData       `json:"-"`
 	ID   types.JID                 `json:"id"`
 	Mute types.NewsletterMuteState `json:"mute"`
 }
@@ -620,4 +650,11 @@ type NewsletterLiveUpdate struct {
 	JID      types.JID
 	Time     time.Time
 	Messages []*types.NewsletterMessage
+}
+
+type NotifyAccountReachoutTimelock struct {
+	Mex                 MexNotificationData `json:"-"`
+	EnforcementType     string              `json:"enforcement_type,omitempty"`
+	IsActive            bool                `json:"is_active,omitempty"`
+	TimeEnforcementEnds jsontime.UnixString `json:"time_enforcement_ends,omitzero"`
 }
