@@ -476,7 +476,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	resp.Timestamp = ag.UnixTime("t")
 	if errorCode := ag.Int("error"); errorCode != 0 {
 		err = fmt.Errorf("%w %d", ErrServerReturnedError, errorCode)
-		resp.RawErrorResponse = respNode.XMLString()
+		resp.RawErrorResponse = respNode.String()
 		if rejected := ag.OptionalJID("participant"); rejected != nil {
 			resp.RejectedParticipant = *rejected
 		}
