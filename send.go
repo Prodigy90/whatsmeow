@@ -1130,7 +1130,10 @@ func (cli *Client) preparePeerMessageNode(
 		}
 	}
 	start = time.Now()
+	// #1168: hold the per-address session lock across this load-modify-store.
+	unlockSession := cli.Store.LockSession(encryptionIdentity.SignalAddress().String())
 	encrypted, isPreKey, err := cli.encryptMessageForDevice(ctx, plaintext, encryptionIdentity, nil, nil, nil)
+	unlockSession()
 	timings.PeerEncrypt = time.Since(start)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt peer message for %s: %v", to, err)
@@ -1404,6 +1407,15 @@ func (cli *Client) encryptMessageForDevices(
 	sessionAddressToJID := resolution.addrToJID
 	sessionAddresses := resolution.sessionAddresses
 
+	// #1168: the decrypt path does its own read-modify-write of the same session
+	// rows; without the lock, either side's ratchet advance can be lost — and our
+	// ctx-cached flush (PutCachedSessions below) makes lost updates more likely.
+	// Held across the whole load-encrypt-flush cycle (released only for the prekey
+	// network round trip below).
+	unlockSessions := cli.Store.LockSessions(sessionAddresses)
+	defer func() { unlockSessions() }()
+	baseCtx := ctx
+
 	prefetchStart := time.Now()
 	existingSessions, ctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
 	if err != nil {
@@ -1426,7 +1438,25 @@ func (cli *Client) encryptMessageForDevices(
 			retryDevices = append(retryDevices, sessionAddressToJID[addr])
 		}
 	}
-	bundles := cli.fetchPreKeysNoError(ctx, retryDevices)
+	var bundles map[types.JID]*prekey.Bundle
+	if len(retryDevices) > 0 {
+		// Don't hold the session locks across the prekey network round trip.
+		// Sessions may change while unlocked, so re-read them (and identities)
+		// after re-locking from the pristine baseCtx, otherwise the flush below
+		// would overwrite a concurrent ratchet advance.
+		unlockSessions()
+		unlockSessions = func() {}
+		bundles = cli.fetchPreKeysNoError(ctx, retryDevices)
+		unlockSessions = cli.Store.LockSessions(sessionAddresses)
+		existingSessions, ctx, err = cli.Store.WithCachedSessions(baseCtx, sessionAddresses)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to prefetch sessions: %w", err)
+		}
+		ctx, err = cli.Store.WithCachedIdentities(ctx, sessionAddresses)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to prefetch identities: %w", err)
+		}
+	}
 
 	type encResult struct {
 		node     *waBinary.Node

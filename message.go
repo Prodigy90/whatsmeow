@@ -561,6 +561,12 @@ func (cli *Client) decryptDM(ctx context.Context, child *waBinary.Node, from typ
 		return nil, nil, fmt.Errorf("message content is not a byte slice")
 	}
 
+	// #1168: the send path does its own read-modify-write of this same session
+	// record; without the lock, a concurrent send to this address could
+	// overwrite this decrypt's ratchet advance (and vice versa).
+	unlockSession := cli.Store.LockSession(from.SignalAddress().String())
+	defer unlockSession()
+
 	builder := session.NewBuilderFromSignal(cli.Store, from.SignalAddress(), pbSerializer)
 	cipher := session.NewCipher(builder, from.SignalAddress())
 	var plaintext []byte
