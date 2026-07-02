@@ -194,6 +194,71 @@ func (s *CachedLIDMap) GetManyLIDsForPNs(ctx context.Context, pns []types.JID) (
 	return result, err
 }
 
+// GetManyPNsForLIDs is the batched inverse of GetManyLIDsForPNs: given a set of
+// LID JIDs, it returns their phone-number JIDs. Mirrors GetManyLIDsForPNs exactly
+// (cache-first via lidToPNCache, one `WHERE lid IN (...)` query for the misses),
+// so callers that hold many LIDs (e.g. group-member resolution) avoid an N+1 of
+// per-LID GetPNForLID lookups. Adapted from upstream whatsmeow #974 to our fork's
+// convertLIDRow/scanManyLids row-iter pattern.
+func (s *CachedLIDMap) GetManyPNsForLIDs(ctx context.Context, lids []types.JID) (map[types.JID]types.JID, error) {
+	if len(lids) == 0 {
+		return nil, nil
+	}
+
+	result := make(map[types.JID]types.JID, len(lids))
+
+	s.lidCacheLock.RLock()
+	missingLIDs := make([]string, 0, len(lids))
+	missingLIDDevices := make(map[string][]types.JID)
+	for _, lid := range lids {
+		if lid.Server != types.HiddenUserServer {
+			continue
+		}
+		if pnUser, ok := s.lidToPNCache[lid.User]; ok && pnUser != "" {
+			result[lid] = types.JID{User: pnUser, Device: lid.Device, Server: types.DefaultUserServer}
+		} else if !s.cacheFilled {
+			missingLIDs = append(missingLIDs, lid.User)
+			missingLIDDevices[lid.User] = append(missingLIDDevices[lid.User], lid)
+		}
+	}
+	s.lidCacheLock.RUnlock()
+
+	if len(missingLIDs) == 0 {
+		return result, nil
+	}
+
+	s.lidCacheLock.Lock()
+	defer s.lidCacheLock.Unlock()
+
+	var res dbutil.RowIter[store.LIDMapping]
+	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
+		res = convertLIDRow.NewRowIter(s.db.Query(
+			ctx,
+			`SELECT lid, pn FROM whatsmeow_lid_map WHERE lid = ANY($1)`,
+			PostgresArrayWrapper(missingLIDs),
+		))
+	} else {
+		placeholders := make([]string, len(missingLIDs))
+		for i := range missingLIDs {
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+		}
+		res = convertLIDRow.NewRowIter(s.db.Query(
+			ctx,
+			fmt.Sprintf(`SELECT lid, pn FROM whatsmeow_lid_map WHERE lid IN (%s)`, strings.Join(placeholders, ",")),
+			exslices.CastToAny(missingLIDs)...,
+		))
+	}
+	err := s.scanManyLids(res, func(lid, pn string) {
+		for _, dev := range missingLIDDevices[lid] {
+			pnDev := dev
+			pnDev.Server = types.DefaultUserServer
+			pnDev.User = pn
+			result[dev] = pnDev.ToNonAD()
+		}
+	})
+	return result, err
+}
+
 func (s *CachedLIDMap) PutLIDMapping(ctx context.Context, lid, pn types.JID) error {
 	if lid.Server != types.HiddenUserServer || pn.Server != types.DefaultUserServer {
 		return fmt.Errorf("invalid PutLIDMapping call %s/%s", lid, pn)

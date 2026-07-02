@@ -881,6 +881,10 @@ var putRedactedPhonesMassInsertBuilder = dbutil.NewMassInsertBuilder[store.Redac
 	putRedactedPhoneQuery, "($1, $%d, $%d)",
 )
 
+var putMsgSecretsMassInsertBuilder = dbutil.NewMassInsertBuilder[store.MessageSecretInsert, [1]any](
+	putMsgSecret, "($1, $%d, $%d, $%d, $%d)",
+)
+
 func (s *SQLStore) PutPushName(ctx context.Context, user types.JID, pushName string) (bool, string, error) {
 	s.contactCacheLock.Lock()
 	defer s.contactCacheLock.Unlock()
@@ -1157,14 +1161,16 @@ const (
 	`
 )
 
-func (s *SQLStore) PutMessageSecrets(ctx context.Context, inserts []store.MessageSecretInsert) (err error) {
+const msgSecretsBatchSize = 500
+
+func (s *SQLStore) PutMessageSecrets(ctx context.Context, inserts []store.MessageSecretInsert) error {
 	if len(inserts) == 0 {
 		return nil
 	}
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		for _, insert := range inserts {
-			_, err = s.db.Exec(ctx, putMsgSecret, s.JID, insert.Chat.ToNonAD(), insert.Sender.ToNonAD(), insert.ID, insert.Secret)
-			if err != nil {
+		for chunk := range slices.Chunk(inserts, msgSecretsBatchSize) {
+			query, params := putMsgSecretsMassInsertBuilder.Build([1]any{s.JID}, chunk)
+			if _, err := s.db.Exec(ctx, query, params...); err != nil {
 				return err
 			}
 		}

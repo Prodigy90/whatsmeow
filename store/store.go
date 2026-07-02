@@ -140,6 +140,10 @@ type MessageSecretInsert struct {
 	Secret []byte
 }
 
+func (m MessageSecretInsert) GetMassInsertValues() [4]any {
+	return [...]any{m.Chat.ToNonAD(), m.Sender.ToNonAD(), m.ID, m.Secret}
+}
+
 type MsgSecretStore interface {
 	PutMessageSecrets(ctx context.Context, inserts []MessageSecretInsert) error
 	PutMessageSecret(ctx context.Context, chat, sender types.JID, id types.MessageID, secret []byte) error
@@ -198,6 +202,7 @@ type LIDStore interface {
 	GetPNForLID(ctx context.Context, lid types.JID) (types.JID, error)
 	GetLIDForPN(ctx context.Context, pn types.JID) (types.JID, error)
 	GetManyLIDsForPNs(ctx context.Context, pns []types.JID) (map[types.JID]types.JID, error)
+	GetManyPNsForLIDs(ctx context.Context, lids []types.JID) (map[types.JID]types.JID, error)
 }
 
 // DeviceListEntry is one persisted per-contact device-list cache row (the result
