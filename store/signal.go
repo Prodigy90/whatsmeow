@@ -99,6 +99,30 @@ func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalA
 		return sess, nil
 	}
 
+	if loader, ok := device.Sessions.(sessionLoader); ok {
+		// Streaming path: deserialize straight from the driver's buffer without an
+		// intermediate blob copy.
+		var sess *record.Session
+		_, err := loader.IterateSession(ctx, addrString, func(rawSess []byte) error {
+			if len(rawSess) == 0 {
+				return nil // NULL session row — treated as no session below
+			}
+			var serr error
+			sess, serr = record.NewSessionFromBytes(rawSess, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
+			if serr != nil {
+				return fmt.Errorf("failed to deserialize session with %s: %w", addrString, serr)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to load session with %s: %w", addrString, err)
+		}
+		if sess == nil {
+			return record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State), nil
+		}
+		return sess, nil
+	}
+
 	rawSess, err := device.Sessions.GetSession(ctx, addrString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load session with %s: %w", addrString, err)
