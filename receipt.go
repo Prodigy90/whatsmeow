@@ -21,19 +21,28 @@ import (
 
 func (cli *Client) handleReceipt(ctx context.Context, node *waBinary.Node) {
 	var cancelled bool
-	defer cli.maybeDeferredAck(ctx, node)(&cancelled)
-	receipt, err := cli.parseReceipt(node)
+	receipt, participants, err := cli.parseReceipt(node)
 	if err != nil {
 		cli.Log.Warnf("Failed to parse receipt: %v", err)
-	} else if receipt != nil {
+		go cli.sendAck(ctx, node, NackParsingError)
+	} else if participants != nil {
+		defer cli.maybeDeferredAck(ctx, node)(&cancelled)
+		fallbackMessageID := node.AttrGetter().OptionalString("id")
+		for _, pcp := range participants {
+			cancelled = cli.handleGroupedReceipt(*receipt, &pcp, fallbackMessageID) || cancelled
+		}
+	} else {
 		if receipt.Type == types.ReceiptTypeRetry {
+			// Ack happens inside the retry receipt handler
 			go cli.tryHandleRetryReceipt(ctx, receipt, node)
+		} else {
+			defer cli.maybeDeferredAck(ctx, node)(&cancelled)
 		}
 		cancelled = cli.dispatchEvent(receipt)
 	}
 }
 
-func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participants *waBinary.Node, fallbackMessageID types.MessageID) {
+func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participants *waBinary.Node, fallbackMessageID types.MessageID) (cancelled bool) {
 	pag := participants.AttrGetter()
 	// WhatsApp uses "message_id" for status broadcast receipts, "key" for other grouped receipts.
 	// Falls back to the parent <receipt> node's id when neither attr is set (newer status broadcast format).
@@ -67,15 +76,16 @@ func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participa
 			cli.Log.Warnf("Failed to parse user node %s in grouped receipt: %v", &child, ag.Error())
 			continue
 		}
-		cli.dispatchEvent(&receipt)
+		cancelled = cli.dispatchEvent(&receipt) || cancelled
 	}
+	return
 }
 
-func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, error) {
+func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, []waBinary.Node, error) {
 	ag := node.AttrGetter()
 	source, err := cli.parseMessageSource(node, false)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	receipt := events.Receipt{
 		MessageSource: source,
@@ -84,19 +94,15 @@ func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, error) {
 		MessageSender: ag.OptionalJIDOrEmpty("recipient"),
 	}
 	if source.IsGroup && source.Sender.IsEmpty() {
-		fallbackMessageID := ag.OptionalString("id")
 		participantTags := node.GetChildrenByTag("participants")
 		if len(participantTags) == 0 {
-			return nil, &ElementMissingError{Tag: "participants", In: "grouped receipt"}
+			return nil, nil, &ElementMissingError{Tag: "participants", In: "grouped receipt"}
 		}
-		for _, pcp := range participantTags {
-			cli.handleGroupedReceipt(receipt, &pcp, fallbackMessageID)
-		}
-		return nil, nil
+		return &receipt, participantTags, nil
 	}
 	mainMessageID := ag.String("id")
 	if !ag.OK() {
-		return nil, fmt.Errorf("failed to parse read receipt attrs: %+v", ag.Errors)
+		return nil, nil, fmt.Errorf("failed to parse read receipt attrs: %+v", ag.Errors)
 	}
 
 	receiptChildren := node.GetChildren()
@@ -112,7 +118,7 @@ func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, error) {
 	} else {
 		receipt.MessageIDs = []types.MessageID{mainMessageID}
 	}
-	return &receipt, nil
+	return &receipt, nil, nil
 }
 
 func (cli *Client) backgroundIfAsyncAck(fn func()) {
