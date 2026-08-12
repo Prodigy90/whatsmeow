@@ -13,6 +13,8 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -114,9 +116,37 @@ var identityScanner = dbutil.ConvertRowFn[addressIdentityTuple](func(row dbutil.
 // the address set as $2; genericQuery must contain a single %s where the placeholder
 // list ($2,$3,…) is interpolated. Callers pass the resulting (rows, err) straight into
 // their row scanner. Shared by the GetMany*/ContainsMany* readers.
+// wrapPostgresArray converts a Go slice into a value the active Postgres driver can
+// bind as a PG array: via PostgresArrayWrapper (lib/pq) when set, or passed through
+// raw for pgx stdlib, which encodes Go slices natively. ok=false means no array
+// support — callers fall back to generated placeholders / chunked statements.
+func wrapPostgresArray(db *dbutil.Database, value any) (any, bool) {
+	if db.Dialect != dbutil.Postgres {
+		return nil, false
+	}
+	if PostgresArrayWrapper != nil {
+		return PostgresArrayWrapper(value), true
+	}
+	if isNativePostgresArrayDriver(db) {
+		return value, true
+	}
+	return nil, false
+}
+
+func isNativePostgresArrayDriver(db *dbutil.Database) bool {
+	driverType := reflect.TypeOf(db.RawDB.Driver())
+	if driverType == nil {
+		return false
+	}
+	if driverType.Kind() == reflect.Pointer {
+		driverType = driverType.Elem()
+	}
+	return driverType.PkgPath() == "github.com/jackc/pgx/v5/stdlib"
+}
+
 func (s *SQLStore) queryByAddresses(ctx context.Context, pgQuery, genericQuery string, addresses []string) (dbutil.Rows, error) {
-	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
-		return s.db.Query(ctx, pgQuery, s.JID, PostgresArrayWrapper(addresses))
+	if wrapped, ok := wrapPostgresArray(s.db, addresses); ok {
+		return s.db.Query(ctx, pgQuery, s.JID, wrapped)
 	}
 	args := make([]any, len(addresses)+1)
 	placeholders := make([]string, len(addresses))
@@ -153,13 +183,42 @@ func (s *SQLStore) GetManyIdentities(ctx context.Context, addresses []string) (m
 
 const identityBatchSize = 500
 
+// putManyIdentitiesQueryPostgres upserts the whole batch in one statement with three
+// binds (jid + two arrays paired positionally by UNNEST), regardless of batch size —
+// no per-row placeholders, no explicit transaction.
+const putManyIdentitiesQueryPostgres = `
+	INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity)
+	SELECT $1, batch.their_id, batch.identity
+	FROM UNNEST($2::text[], $3::bytea[]) AS batch(their_id, identity)
+	ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
+`
+
 func (s *SQLStore) PutManyIdentities(ctx context.Context, identities map[string][32]byte) error {
 	if len(identities) == 0 {
 		return nil
 	}
-	entries := make([]identityEntry, 0, len(identities))
-	for addr, key := range identities {
+	// Sorted row order so concurrent batch upserts touching the same addresses take
+	// row locks in the same order instead of deadlocking each other.
+	addresses := slices.Sorted(maps.Keys(identities))
+	if wrappedAddrs, ok := wrapPostgresArray(s.db, addresses); ok {
+		keyBlobs := make([][]byte, len(addresses))
+		for i, addr := range addresses {
+			key := identities[addr]
+			keyBlobs[i] = key[:]
+		}
+		wrappedBlobs, _ := wrapPostgresArray(s.db, keyBlobs)
+		_, err := s.db.Exec(ctx, putManyIdentitiesQueryPostgres, s.JID, wrappedAddrs, wrappedBlobs)
+		return err
+	}
+	entries := make([]identityEntry, 0, len(addresses))
+	for _, addr := range addresses {
+		key := identities[addr]
 		entries = append(entries, identityEntry{Address: addr, Identity: key[:]})
+	}
+	if len(entries) <= identityBatchSize {
+		query, vars := putIdentitiesMassInsertBuilder.Build([1]any{s.JID}, entries)
+		_, err := s.db.Exec(ctx, query, vars...)
+		return err
 	}
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
 		for slice := range slices.Chunk(entries, identityBatchSize) {
@@ -211,6 +270,15 @@ const (
 	containsManySessionsQueryGeneric  = `SELECT their_id FROM whatsmeow_sessions WHERE our_jid=$1 AND session IS NOT NULL AND their_id IN (%s)`
 	putSessionQuery                   = `
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session) VALUES ($1, $2, $3)
+		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
+	`
+	// putManySessionsQueryPostgres upserts the whole batch in one statement with three
+	// binds (jid + two arrays paired positionally by UNNEST), regardless of batch size —
+	// no per-row placeholders, no explicit transaction.
+	putManySessionsQueryPostgres = `
+		INSERT INTO whatsmeow_sessions (our_jid, their_id, session)
+		SELECT $1, batch.their_id, batch.session
+		FROM UNNEST($2::text[], $3::bytea[]) AS batch(their_id, session)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
 	deleteAllSessionsQuery = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'`
@@ -331,9 +399,29 @@ func (s *SQLStore) PutManySessions(ctx context.Context, sessions map[string][]by
 	if len(sessions) == 0 {
 		return nil
 	}
-	entries := make([]sessionEntry, 0, len(sessions))
-	for addr, sess := range sessions {
-		entries = append(entries, sessionEntry{Address: addr, Session: sess})
+	// Sorted row order so concurrent batch upserts touching the same addresses take
+	// row locks in the same order instead of deadlocking each other.
+	addresses := slices.Sorted(maps.Keys(sessions))
+	if len(addresses) == 1 {
+		return s.PutSession(ctx, addresses[0], sessions[addresses[0]])
+	}
+	if wrappedAddrs, ok := wrapPostgresArray(s.db, addresses); ok {
+		blobs := make([][]byte, len(addresses))
+		for i, addr := range addresses {
+			blobs[i] = sessions[addr]
+		}
+		wrappedBlobs, _ := wrapPostgresArray(s.db, blobs)
+		_, err := s.db.Exec(ctx, putManySessionsQueryPostgres, s.JID, wrappedAddrs, wrappedBlobs)
+		return err
+	}
+	entries := make([]sessionEntry, 0, len(addresses))
+	for _, addr := range addresses {
+		entries = append(entries, sessionEntry{Address: addr, Session: sessions[addr]})
+	}
+	if len(entries) <= sessionBatchSize {
+		query, vars := putSessionsMassInsertBuilder.Build([1]any{s.JID}, entries)
+		_, err := s.db.Exec(ctx, query, vars...)
+		return err
 	}
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
 		for slice := range slices.Chunk(entries, sessionBatchSize) {
@@ -344,6 +432,52 @@ func (s *SQLStore) PutManySessions(ctx context.Context, sessions map[string][]by
 			}
 		}
 		return nil
+	})
+}
+
+type rawAddressSessionTuple struct {
+	Address string
+	Session sql.RawBytes
+}
+
+var rawSessionScanner = dbutil.ConvertRowFn[rawAddressSessionTuple](func(row dbutil.Scannable) (out rawAddressSessionTuple, err error) {
+	err = row.Scan(&out.Address, &out.Session)
+	return
+})
+
+// IterateSession streams the stored session blob for a single address into callback
+// without an intermediate copy. The bytes are only valid for the duration of the
+// callback (sql.RawBytes). Returns whether a row existed.
+func (s *SQLStore) IterateSession(ctx context.Context, address string, callback func([]byte) error) (bool, error) {
+	rows, err := s.db.Query(ctx, getSessionQuery, s.JID, address)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return false, rows.Err()
+	}
+	var session sql.RawBytes
+	if err = rows.Scan(&session); err != nil {
+		return false, err
+	}
+	if err = callback(session); err != nil {
+		return false, err
+	}
+	return true, rows.Err()
+}
+
+// IterateSessions streams stored session blobs for the given addresses into callback
+// row by row, without materializing a map of blob copies (sql.RawBytes — bytes are
+// only valid for the duration of each callback). Rows with NULL sessions yield a nil
+// byte slice; addresses with no row are simply not passed to the callback.
+func (s *SQLStore) IterateSessions(ctx context.Context, addresses []string, callback func(string, []byte) error) error {
+	if len(addresses) == 0 {
+		return nil
+	}
+	rows, err := s.queryByAddresses(ctx, getManySessionQueryPostgres, getManySessionQueryGeneric, addresses)
+	return rawSessionScanner.NewRowIter(rows, err).Iter(func(tuple rawAddressSessionTuple) (bool, error) {
+		return true, callback(tuple.Address, tuple.Session)
 	})
 }
 
@@ -1166,6 +1300,11 @@ const msgSecretsBatchSize = 500
 func (s *SQLStore) PutMessageSecrets(ctx context.Context, inserts []store.MessageSecretInsert) error {
 	if len(inserts) == 0 {
 		return nil
+	}
+	if len(inserts) <= msgSecretsBatchSize {
+		query, params := putMsgSecretsMassInsertBuilder.Build([1]any{s.JID}, inserts)
+		_, err := s.db.Exec(ctx, query, params...)
+		return err
 	}
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
 		for chunk := range slices.Chunk(inserts, msgSecretsBatchSize) {
