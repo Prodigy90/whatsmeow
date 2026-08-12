@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -115,9 +116,37 @@ var identityScanner = dbutil.ConvertRowFn[addressIdentityTuple](func(row dbutil.
 // the address set as $2; genericQuery must contain a single %s where the placeholder
 // list ($2,$3,…) is interpolated. Callers pass the resulting (rows, err) straight into
 // their row scanner. Shared by the GetMany*/ContainsMany* readers.
+// wrapPostgresArray converts a Go slice into a value the active Postgres driver can
+// bind as a PG array: via PostgresArrayWrapper (lib/pq) when set, or passed through
+// raw for pgx stdlib, which encodes Go slices natively. ok=false means no array
+// support — callers fall back to generated placeholders / chunked statements.
+func wrapPostgresArray(db *dbutil.Database, value any) (any, bool) {
+	if db.Dialect != dbutil.Postgres {
+		return nil, false
+	}
+	if PostgresArrayWrapper != nil {
+		return PostgresArrayWrapper(value), true
+	}
+	if isNativePostgresArrayDriver(db) {
+		return value, true
+	}
+	return nil, false
+}
+
+func isNativePostgresArrayDriver(db *dbutil.Database) bool {
+	driverType := reflect.TypeOf(db.RawDB.Driver())
+	if driverType == nil {
+		return false
+	}
+	if driverType.Kind() == reflect.Pointer {
+		driverType = driverType.Elem()
+	}
+	return driverType.PkgPath() == "github.com/jackc/pgx/v5/stdlib"
+}
+
 func (s *SQLStore) queryByAddresses(ctx context.Context, pgQuery, genericQuery string, addresses []string) (dbutil.Rows, error) {
-	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
-		return s.db.Query(ctx, pgQuery, s.JID, PostgresArrayWrapper(addresses))
+	if wrapped, ok := wrapPostgresArray(s.db, addresses); ok {
+		return s.db.Query(ctx, pgQuery, s.JID, wrapped)
 	}
 	args := make([]any, len(addresses)+1)
 	placeholders := make([]string, len(addresses))
@@ -171,13 +200,14 @@ func (s *SQLStore) PutManyIdentities(ctx context.Context, identities map[string]
 	// Sorted row order so concurrent batch upserts touching the same addresses take
 	// row locks in the same order instead of deadlocking each other.
 	addresses := slices.Sorted(maps.Keys(identities))
-	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
+	if wrappedAddrs, ok := wrapPostgresArray(s.db, addresses); ok {
 		keyBlobs := make([][]byte, len(addresses))
 		for i, addr := range addresses {
 			key := identities[addr]
 			keyBlobs[i] = key[:]
 		}
-		_, err := s.db.Exec(ctx, putManyIdentitiesQueryPostgres, s.JID, PostgresArrayWrapper(addresses), PostgresArrayWrapper(keyBlobs))
+		wrappedBlobs, _ := wrapPostgresArray(s.db, keyBlobs)
+		_, err := s.db.Exec(ctx, putManyIdentitiesQueryPostgres, s.JID, wrappedAddrs, wrappedBlobs)
 		return err
 	}
 	entries := make([]identityEntry, 0, len(addresses))
@@ -375,12 +405,13 @@ func (s *SQLStore) PutManySessions(ctx context.Context, sessions map[string][]by
 	if len(addresses) == 1 {
 		return s.PutSession(ctx, addresses[0], sessions[addresses[0]])
 	}
-	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
+	if wrappedAddrs, ok := wrapPostgresArray(s.db, addresses); ok {
 		blobs := make([][]byte, len(addresses))
 		for i, addr := range addresses {
 			blobs[i] = sessions[addr]
 		}
-		_, err := s.db.Exec(ctx, putManySessionsQueryPostgres, s.JID, PostgresArrayWrapper(addresses), PostgresArrayWrapper(blobs))
+		wrappedBlobs, _ := wrapPostgresArray(s.db, blobs)
+		_, err := s.db.Exec(ctx, putManySessionsQueryPostgres, s.JID, wrappedAddrs, wrappedBlobs)
 		return err
 	}
 	entries := make([]sessionEntry, 0, len(addresses))

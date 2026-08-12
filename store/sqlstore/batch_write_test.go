@@ -196,6 +196,31 @@ func TestPutManySessionsGenericSingleChunkSkipsTxn(t *testing.T) {
 	}
 }
 
+func TestPutManySessionsPostgresWithoutArraySupportFallsBack(t *testing.T) {
+	// Postgres dialect but NO PostgresArrayWrapper and a non-pgx driver: the UNNEST
+	// path must not engage (its array binds would fail); we fall back to the
+	// placeholder-built single statement.
+	state := &recordingDB{}
+	s := newRecordingStore(t, "postgres", state)
+
+	err := s.PutManySessions(context.Background(), map[string][]byte{
+		"222:1": []byte("s2"),
+		"111:1": []byte("s1"),
+	})
+	if err != nil {
+		t.Fatalf("PutManySessions: %v", err)
+	}
+	if len(state.execs) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(state.execs))
+	}
+	if strings.Contains(state.execs[0].query, "UNNEST") {
+		t.Errorf("UNNEST must not be used without array support: %s", state.execs[0].query)
+	}
+	if state.begins != 0 {
+		t.Errorf("expected no transaction for a single chunk, got %d begins", state.begins)
+	}
+}
+
 func TestPutManyIdentitiesPostgresUsesSingleUnnestStatementWithoutTxn(t *testing.T) {
 	withTestArrayWrapper(t)
 	state := &recordingDB{}
