@@ -437,8 +437,16 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		// probe on 2026-09-04 failed MAC verification on 4 of 5 patch types
 		// (missing app state keys), and the one that decoded — critical_block —
 		// is not a plausible carrier. This log is the passive way to find out.
+		//
+		// The pnForLidChat case logs at INFO, everything else at DEBUG. That is
+		// deliberate: this needs to be observable in production, where the
+		// whatsmeow client logger runs at SILENT/WARN and a DEBUG line would
+		// never be emitted. It is also low volume by construction — one line
+		// per LID chat whose PN the server volunteers — whereas the generic
+		// branch fires for every unhandled type in a full-sync batch and must
+		// stay at DEBUG.
 		if pn := mutation.Action.GetPnForLidChatAction().GetPnJID(); pn != "" {
-			cli.Log.Debugf("Unhandled app state mutation %s for %s carries pnForLidChat pn=%s (full_sync=%t)", mutation.Index[0], jid, pn, fullSync)
+			cli.Log.Infof("pnForLidChat app state mutation: lid=%s pn=%s (full_sync=%t)", jid, pn, fullSync)
 		} else {
 			cli.Log.Debugf("Unhandled app state mutation %s for %s (full_sync=%t)", mutation.Index[0], jid, fullSync)
 		}
