@@ -417,39 +417,35 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			Action:       act,
 			FromFullSync: fullSync,
 		}
+	case appstate.IndexPNForLIDChat:
+		// WhatsApp telling our own linked devices which phone number is behind a
+		// LID chat. This is the mapping usync stopped returning around 2026-06-01,
+		// except it arrives on a push channel — no request, no usync budget, no
+		// ban vector. Upstream whatsmeow, hypermeow and whatsapp-rust all define
+		// the constant and never read it; Baileys emits lid-mapping.update from
+		// it, Cobalt has a dedicated PnForLidChatHandler, and WhatsApp Web's own
+		// WAWebPnForLidChatSync feeds it straight into WAWebDBCreateLidPnMappings.
+		//
+		// Wire format confirmed from two live prod mutations (2026-09-06):
+		// Index[1] = "163213203263512@lid", PnJID = "2349093784721@s.whatsapp.net"
+		// — both full JIDs, so ParseJID is the right reader for each.
+		if pnStr := mutation.Action.GetPnForLidChatAction().GetPnJID(); pnStr != "" {
+			pn, parseErr := types.ParseJID(pnStr)
+			if parseErr != nil {
+				cli.Log.Warnf("Failed to parse pnForLidChat PN %q for %s: %v", pnStr, jid, parseErr)
+			} else {
+				cli.Log.Debugf("pnForLidChat app state mutation: lid=%s pn=%s (full_sync=%t)", jid, pn, fullSync)
+				cli.StoreLIDPNMapping(ctx, jid, pn)
+			}
+		}
 	default:
 		// Upstream has never had a default branch here, so any action WhatsApp
 		// sends that we have no case for is dropped silently — no log, no
 		// counter, no way to know it ever arrived. That makes "does WA send X?"
-		// unanswerable without patching the library, which is exactly the hole
-		// this fills. Debug level: this fires per unhandled mutation and app
-		// state can arrive in large full-sync batches, so it must not be INFO.
-		//
-		// Motivating case: IndexPNForLIDChat ("pnForLidChat"). Its payload is a
-		// single PnJID field — WhatsApp telling our own linked devices which
-		// phone number is behind a LID chat. That is precisely the mapping
-		// usync stopped returning around 2026-06-01, except it arrives on a
-		// PUSH channel that never crosses the privacy boundary the lookup did
-		// (no request, no usync budget, no ban vector). The constant is defined
-		// in appstate/keys.go and referenced nowhere else in the tree.
-		//
-		// Whether WA actually emits it for our sessions is UNMEASURED: a direct
-		// probe on 2026-09-04 failed MAC verification on 4 of 5 patch types
-		// (missing app state keys), and the one that decoded — critical_block —
-		// is not a plausible carrier. This log is the passive way to find out.
-		//
-		// The pnForLidChat case logs at INFO, everything else at DEBUG. That is
-		// deliberate: this needs to be observable in production, where the
-		// whatsmeow client logger runs at SILENT/WARN and a DEBUG line would
-		// never be emitted. It is also low volume by construction — one line
-		// per LID chat whose PN the server volunteers — whereas the generic
-		// branch fires for every unhandled type in a full-sync batch and must
-		// stay at DEBUG.
-		if pn := mutation.Action.GetPnForLidChatAction().GetPnJID(); pn != "" {
-			cli.Log.Infof("pnForLidChat app state mutation: lid=%s pn=%s (full_sync=%t)", jid, pn, fullSync)
-		} else {
-			cli.Log.Debugf("Unhandled app state mutation %s for %s (full_sync=%t)", mutation.Index[0], jid, fullSync)
-		}
+		// unanswerable without patching the library. Debug level: this fires per
+		// unhandled mutation and app state can arrive in large full-sync batches,
+		// so it must not be INFO.
+		cli.Log.Debugf("Unhandled app state mutation %s for %s (full_sync=%t)", mutation.Index[0], jid, fullSync)
 	}
 	if storeUpdateError != nil {
 		cli.Log.Errorf("Failed to update device store after app state mutation: %v", storeUpdateError)
