@@ -103,7 +103,19 @@ func (cli *Client) parseMessageSource(node *waBinary.Node, requireParticipant bo
 		} else {
 			source.Sender = ag.OptionalJIDOrEmpty("participant")
 		}
-		if source.AddressingMode == types.AddressingModeLID {
+		// Pick the alt-JID attribute from what the participant ACTUALLY is, not
+		// from the declared addressing_mode. WhatsApp omits addressing_mode
+		// entirely on receipts — 0 of 8,868 observed receipt nodes carried it —
+		// so keying on it sent every status receipt down the participant_lid
+		// branch, where nothing exists for a LID participant, and silently
+		// discarded the participant_pn WhatsApp had just handed us.
+		//
+		// The two sibling branches below (own-message, DM) already key on the
+		// JID's server; this makes the group/broadcast branch consistent with
+		// them. WhatsApp Web agrees: its LID-mapping modules
+		// (WAWebProcessPhoneNumberMapping, WAWebHandleStatusReceipt) branch on
+		// isLid() and contain no addressing-mode check at all.
+		if source.Sender.Server == types.HiddenUserServer || source.Sender.Server == types.HostedLIDServer {
 			source.SenderAlt = ag.OptionalJIDOrEmpty("participant_pn")
 		} else {
 			source.SenderAlt = ag.OptionalJIDOrEmpty("participant_lid")

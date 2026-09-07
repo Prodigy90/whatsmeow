@@ -22,6 +22,16 @@ import (
 func (cli *Client) handleReceipt(ctx context.Context, node *waBinary.Node) {
 	var cancelled bool
 	receipt, participants, err := cli.parseReceipt(node)
+	if err == nil && !receipt.SenderAlt.IsEmpty() {
+		// A receipt whose participant is a LID often arrives with participant_pn
+		// alongside it. That pair is a free LID→PN mapping on a push channel —
+		// no usync, no request, no privacy boundary crossed — and it is what
+		// WhatsApp Web itself learns from (WAWebHandleStatusReceipt writes it
+		// with learningSource "status-receipt"). Done once here, from the parent
+		// node, so the grouped path cannot fan a single PN out over N senders.
+		// StoreLIDPNMapping validates the servers and ignores anything else.
+		cli.StoreLIDPNMapping(ctx, receipt.SenderAlt, receipt.Sender)
+	}
 	if err != nil {
 		cli.Log.Warnf("Failed to parse receipt: %v", err)
 		go cli.sendAck(ctx, node, NackParsingError)
@@ -63,6 +73,15 @@ func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participa
 		receipt := partialReceipt
 		receipt.Timestamp = ag.UnixTime("t")
 		receipt.MessageSource.Sender = ag.JID("jid")
+		// Each <user> child is a DIFFERENT sender, but SenderAlt was copied from
+		// the parent <receipt> node along with the rest of partialReceipt. Leaving
+		// it would pair the parent's phone number with every child's LID — and
+		// PutLIDMapping deletes conflicting rows before inserting, so a wrong pair
+		// destroys a correct one. Clear it. Whether WhatsApp ever puts a
+		// per-participant PN on these children is unverified: every participant_pn
+		// observed so far (harness captures + 258 live receipt nodes) was on a
+		// non-grouped receipt. If one is found, read it here rather than inheriting.
+		receipt.MessageSource.SenderAlt = types.EmptyJID
 		// Status broadcast receipts put the type on each <user> node (e.g. "delivery", "read")
 		// rather than on the parent <receipt> node. Read from user node when present.
 		if userType := ag.OptionalString("type"); userType != "" {
