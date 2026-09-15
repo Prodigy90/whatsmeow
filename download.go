@@ -49,6 +49,12 @@ const (
 
 	MediaStickerPack   MediaType = "WhatsApp Sticker Pack Keys"
 	MediaLinkThumbnail MediaType = "WhatsApp Link Thumbnail Keys"
+
+	// MediaImageThumbnail and MediaVideoThumbnail are the separately uploaded thumbnails
+	// referenced by ThumbnailDirectPath on image and video messages. They are encrypted
+	// with the parent message's MediaKey, so upload them with [Client.UploadWithKey].
+	MediaImageThumbnail MediaType = "WhatsApp Image Thumbnail Keys"
+	MediaVideoThumbnail MediaType = "WhatsApp Video Thumbnail Keys"
 )
 
 // DownloadableMessage represents a protobuf message that contains attachment info.
@@ -89,6 +95,8 @@ var (
 	_ DownloadableMessage   = (*waE2E.HistorySyncNotification)(nil)
 	_ DownloadableMessage   = (*waServerSync.ExternalBlobReference)(nil)
 	_ DownloadableThumbnail = (*waE2E.ExtendedTextMessage)(nil)
+	_ DownloadableThumbnail = (*waE2E.ImageMessage)(nil)
+	_ DownloadableThumbnail = (*waE2E.VideoMessage)(nil)
 	_ DownloadableMessage   = (*types.StickerPackItem)(nil)
 )
 
@@ -107,6 +115,8 @@ var classToMediaType = map[protoreflect.Name]MediaType{
 
 var classToThumbnailMediaType = map[protoreflect.Name]MediaType{
 	"ExtendedTextMessage": MediaLinkThumbnail,
+	"ImageMessage":        MediaImageThumbnail,
+	"VideoMessage":        MediaVideoThumbnail,
 }
 
 var mediaTypeToMMSType = map[MediaType]string{
@@ -119,6 +129,9 @@ var mediaTypeToMMSType = map[MediaType]string{
 
 	MediaStickerPack:   "sticker-pack",
 	MediaLinkThumbnail: "thumbnail-link",
+
+	MediaImageThumbnail: "thumbnail-image",
+	MediaVideoThumbnail: "thumbnail-video",
 }
 
 // DownloadAny loops through the downloadable parts of the given message and downloads the first non-nil item.

@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +38,10 @@ type UploadResponse struct {
 	FileEncSHA256 []byte `json:"-"`
 	FileSHA256    []byte `json:"-"`
 	FileLength    uint64 `json:"-"`
+
+	// StreamingSidecar is set for MediaVideo uploads. Copy it to VideoMessage.StreamingSidecar
+	// so recipients can verify and play the video while it is still downloading.
+	StreamingSidecar []byte `json:"-"`
 }
 
 // Upload uploads the given attachment to WhatsApp servers.
@@ -67,8 +72,22 @@ type UploadResponse struct {
 //
 // The same applies to the other message types like DocumentMessage, just replace the struct type and Message field name.
 func (cli *Client) Upload(ctx context.Context, plaintext []byte, appInfo MediaType) (resp UploadResponse, err error) {
+	return cli.UploadWithKey(ctx, plaintext, appInfo, random.Bytes(32))
+}
+
+// UploadWithKey is otherwise identical to [Upload], but encrypts with the given 32-byte media key
+// instead of generating a new one.
+//
+// This is needed for thumbnails that are uploaded separately from their message's media
+// (MediaImageThumbnail, MediaVideoThumbnail): they must use the same MediaKey as the image or
+// video, and the response fields map to ThumbnailDirectPath, ThumbnailSHA256 and ThumbnailEncSHA256.
+func (cli *Client) UploadWithKey(ctx context.Context, plaintext []byte, appInfo MediaType, mediaKey []byte) (resp UploadResponse, err error) {
+	if len(mediaKey) != 32 {
+		err = fmt.Errorf("media key must be 32 bytes, got %d", len(mediaKey))
+		return
+	}
 	resp.FileLength = uint64(len(plaintext))
-	resp.MediaKey = random.Bytes(32)
+	resp.MediaKey = mediaKey
 
 	plaintextSHA256 := sha256.Sum256(plaintext)
 	resp.FileSHA256 = plaintextSHA256[:]
@@ -89,6 +108,14 @@ func (cli *Client) Upload(ctx context.Context, plaintext []byte, appInfo MediaTy
 
 	dataHash := sha256.Sum256(dataToUpload)
 	resp.FileEncSHA256 = dataHash[:]
+
+	if appInfo == MediaVideo {
+		resp.StreamingSidecar, err = calculateStreamingSidecar(macKey, iv, bytes.NewReader(dataToUpload))
+		if err != nil {
+			err = fmt.Errorf("failed to calculate streaming sidecar: %w", err)
+			return
+		}
+	}
 
 	err = cli.rawUpload(ctx, bytes.NewReader(dataToUpload), uint64(len(dataToUpload)), resp.FileEncSHA256, appInfo, false, &resp)
 	return
@@ -127,8 +154,61 @@ func (cli *Client) UploadReader(ctx context.Context, plaintext io.Reader, tempFi
 		err = fmt.Errorf("failed to seek to start of temporary file: %w", err)
 		return
 	}
+	if appInfo == MediaVideo {
+		resp.StreamingSidecar, err = calculateStreamingSidecar(macKey, iv, io.LimitReader(tempFile, int64(uploadSize)))
+		if err != nil {
+			err = fmt.Errorf("failed to calculate streaming sidecar: %w", err)
+			return
+		}
+		_, err = tempFile.Seek(0, io.SeekStart)
+		if err != nil {
+			err = fmt.Errorf("failed to seek to start of temporary file: %w", err)
+			return
+		}
+	}
 	err = cli.rawUpload(ctx, tempFile, uploadSize, resp.FileEncSHA256, appInfo, false, &resp)
 	return
+}
+
+const (
+	sidecarChunkSize = 64 * 1024
+	sidecarMACSize   = 10
+)
+
+// calculateStreamingSidecar computes the video streaming sidecar the same way WhatsApp Web does
+// (WAMediaCryptoSidecar): over the buffer iv || ciphertext || mac, chunk n is the HMAC-SHA256 of
+// bytes [n*64KiB, (n+1)*64KiB+16), truncated to 10 bytes. Consecutive windows overlap by the
+// 16-byte IV size, and there are ceil(len(ciphertext || mac) / 64KiB) of them.
+//
+// encrypted must yield exactly the uploaded bytes (ciphertext followed by the 10-byte mac).
+func calculateStreamingSidecar(macKey, iv []byte, encrypted io.Reader) ([]byte, error) {
+	window := make([]byte, 0, sidecarChunkSize+len(iv))
+	window = append(window, iv...)
+	var sidecar []byte
+	h := hmac.New(sha256.New, macKey)
+	emit := func() {
+		h.Reset()
+		h.Write(window)
+		sidecar = append(sidecar, h.Sum(nil)[:sidecarMACSize]...)
+	}
+	for {
+		n, err := io.ReadFull(encrypted, window[len(window):cap(window)])
+		window = window[:len(window)+n]
+		if len(window) == cap(window) {
+			emit()
+			// Keep the trailing IV-sized overlap as the start of the next window.
+			window = window[:copy(window, window[sidecarChunkSize:])]
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			break
+		} else if err != nil {
+			return nil, err
+		}
+	}
+	if len(window) > len(iv) {
+		emit()
+	}
+	return sidecar, nil
 }
 
 // UploadNewsletter uploads the given attachment to WhatsApp servers without encrypting it first.
