@@ -311,3 +311,41 @@ func TestIterateSessionCallbackErrorPropagates(t *testing.T) {
 		t.Errorf("expected found=false on callback error")
 	}
 }
+
+func TestPutMessageSecretsDropsIncompleteEntries(t *testing.T) {
+	state := &recordingDB{}
+	s := newRecordingStore(t, "postgres", state)
+
+	chat := types.NewJID("120363000000000000", types.GroupServer)
+	sender := types.NewJID("15550000001", types.DefaultUserServer)
+	inserts := []store.MessageSecretInsert{
+		{Chat: chat, Sender: sender, ID: "OK1", Secret: []byte("k1")},
+		{Chat: types.EmptyJID, Sender: sender, ID: "NOCHAT", Secret: []byte("k")},
+		{Chat: chat, Sender: types.EmptyJID, ID: "NOSENDER", Secret: []byte("k")},
+		{Chat: chat, Sender: sender, ID: "", Secret: []byte("k")},
+		{Chat: chat, Sender: sender, ID: "NOSECRET"},
+		{Chat: chat, Sender: sender, ID: "OK2", Secret: []byte("k2")},
+	}
+	if err := s.PutMessageSecrets(context.Background(), inserts); err != nil {
+		t.Fatalf("PutMessageSecrets: %v", err)
+	}
+	if len(state.execs) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(state.execs))
+	}
+	// $1 is the device JID, then 4 values per surviving row.
+	if got, want := len(state.execs[0].args), 1+4*2; got != want {
+		t.Fatalf("expected %d args (2 valid rows), got %d", want, got)
+	}
+	if inserts[1].ID != "NOCHAT" {
+		t.Errorf("caller's slice was mutated: %+v", inserts[1])
+	}
+
+	state = &recordingDB{}
+	s = newRecordingStore(t, "postgres", state)
+	if err := s.PutMessageSecrets(context.Background(), inserts[1:5]); err != nil {
+		t.Fatalf("PutMessageSecrets (all incomplete): %v", err)
+	}
+	if len(state.execs) != 0 {
+		t.Fatalf("expected no statement when every entry is incomplete, got %d", len(state.execs))
+	}
+}

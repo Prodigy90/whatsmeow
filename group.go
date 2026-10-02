@@ -36,10 +36,6 @@ type ReqCreateGroup struct {
 	Name string
 	// You don't need to include your own JID in the participants array, the WhatsApp servers will add it implicitly.
 	Participants []types.JID
-	// A create key can be provided to deduplicate the group create notification that will be triggered
-	// when the group is created. If provided, the JoinedGroup event will contain the same key.
-	// Deprecated: It seems like WhatsApp no longer sends this.
-	CreateKey types.MessageID
 
 	types.GroupEphemeral
 	types.GroupAnnounce
@@ -141,9 +137,6 @@ func (cli *Client) CreateGroup(ctx context.Context, req ReqCreateGroup) (*types.
 	createAttrs := waBinary.Attrs{}
 	if req.Name != "" {
 		createAttrs["subject"] = req.Name
-	}
-	if req.CreateKey != "" {
-		createAttrs["create_key"] = strings.TrimPrefix(req.CreateKey, "3EB0")
 	}
 	resp, err := cli.sendGroupIQ(ctx, iqSet, types.GroupServerJID, waBinary.Node{
 		Tag:     "create",
@@ -1079,7 +1072,7 @@ func (cli *Client) parseGroupChange(node *waBinary.Node) (*events.GroupInfo, []s
 		case "unlocked":
 			evt.Locked = &types.GroupLocked{IsLocked: false}
 		case "delete":
-			evt.Delete = &types.GroupDelete{Deleted: true, DeleteReason: cag.String("reason")}
+			evt.Delete = &types.GroupDelete{Deleted: true, DeleteReason: cag.OptionalString("reason")}
 		case "subject":
 			evt.Name = &types.GroupName{
 				Name:        cag.String("subject"),
@@ -1275,18 +1268,7 @@ func (cli *Client) SetGroupMemberAddMode(ctx context.Context, jid types.JID, mod
 	return err
 }
 
-// SetGroupDescription updates the group description.
+// Deprecated: duplicate of SetGroupTopic
 func (cli *Client) SetGroupDescription(ctx context.Context, jid types.JID, description string) error {
-	content := waBinary.Node{
-		Tag: "description",
-		Content: []waBinary.Node{
-			{
-				Tag:     "body",
-				Content: []byte(description),
-			},
-		},
-	}
-
-	_, err := cli.sendGroupIQ(ctx, iqSet, jid, content)
-	return err
+	return cli.SetGroupTopic(ctx, jid, "", "", description)
 }
