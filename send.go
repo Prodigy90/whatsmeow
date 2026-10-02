@@ -1367,6 +1367,40 @@ type encIdentityResolution struct {
 // what guarantees prewarm warms the same address the send encrypts to (a drift here would
 // reintroduce the cold prekey burst). Callers decide which devices to include (e.g. the
 // pre-warmer drops its own primary JID/LID first).
+// groupDevicesBySession partitions the indexes of allDevices that need
+// encrypting (non-nil plaintext) by the Signal session address they encrypt
+// against, keeping allDevices order inside each group except that the JID the
+// prekey bundles are keyed under (sessionAddressToJID, the last JID seen for the
+// address) goes first, so a missing session is built before its siblings use it.
+func groupDevicesBySession(
+	allDevices []types.JID,
+	plaintexts [][]byte,
+	encryptionIdentities map[types.JID]types.JID,
+	sessionAddressToJID map[string]types.JID,
+) [][]int {
+	order := make([]string, 0, len(allDevices))
+	byAddr := make(map[string][]int, len(allDevices))
+	for i, jid := range allDevices {
+		if plaintexts[i] == nil {
+			continue
+		}
+		addr := encryptionIdentities[jid].SignalAddress().String()
+		if _, ok := byAddr[addr]; !ok {
+			order = append(order, addr)
+		}
+		if sessionAddressToJID[addr] == jid {
+			byAddr[addr] = append([]int{i}, byAddr[addr]...)
+		} else {
+			byAddr[addr] = append(byAddr[addr], i)
+		}
+	}
+	groups := make([][]int, 0, len(order))
+	for _, addr := range order {
+		groups = append(groups, byAddr[addr])
+	}
+	return groups
+}
+
 func (cli *Client) resolveEncryptionIdentities(ctx context.Context, devices []types.JID) (*encIdentityResolution, error) {
 	var pnDevices []types.JID
 	for _, jid := range devices {
@@ -1510,29 +1544,56 @@ func (cli *Client) encryptMessageForDevices(
 	sem := make(chan struct{}, workers)
 	results := make([]encResult, len(allDevices))
 
-	cli.Log.Debugf("Encrypting for %d devices (%d need prekey bundles), workers=%d", len(allDevices), len(retryDevices), workers)
-	encryptStart := time.Now()
-	var wg sync.WaitGroup
-	for i, jid := range allDevices {
+	// One goroutine per Signal SESSION, not per JID. Several JIDs can resolve to
+	// one session: a device listed in both PN and LID form maps to its LID
+	// session, and a self-send lists our own devices twice. Two goroutines on one
+	// session record both read the same chain key and emit messages with the same
+	// counter, which the recipient drops ("Waiting for this message"). Within a
+	// group the JIDs are encrypted in order, exactly as upstream's sequential loop
+	// does, so each still gets its own node with an advanced counter.
+	groups := groupDevicesBySession(allDevices, plaintexts, encryptionIdentities, sessionAddressToJID)
+	for i := range allDevices {
 		if plaintexts[i] == nil {
 			results[i] = encResult{skip: true}
-			continue
 		}
+	}
+
+	cli.Log.Debugf("Encrypting for %d devices in %d sessions (%d need prekey bundles), workers=%d", len(allDevices), len(groups), len(retryDevices), workers)
+	encryptStart := time.Now()
+	var wg sync.WaitGroup
+	for _, group := range groups {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(idx int, j types.JID, pt []byte) {
+		go func(idxs []int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			defer func() {
-				if r := recover(); r != nil {
-					results[idx] = encResult{err: fmt.Errorf("panic encrypting for %s: %v\n%s", j, r, debug.Stack())}
+			sessionReady := false
+			for _, idx := range idxs {
+				j := allDevices[idx]
+				existing := existingSessions
+				bundle := bundles[j]
+				if sessionReady {
+					// The previous JID in this group just built or advanced the
+					// session in the ctx cache; don't re-process a bundle over it.
+					existing = map[string]bool{encryptionIdentities[j].SignalAddress().String(): true}
+					bundle = nil
 				}
-			}()
-			encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
-				ctx, pt, j, encryptionIdentities[j], bundles[j], encAttrs, existingSessions,
-			)
-			results[idx] = encResult{node: encrypted, isPreKey: isPreKey, err: err}
-		}(i, jid, plaintexts[i])
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							results[idx] = encResult{err: fmt.Errorf("panic encrypting for %s: %v\n%s", j, r, debug.Stack())}
+						}
+					}()
+					encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
+						ctx, plaintexts[idx], j, encryptionIdentities[j], bundle, encAttrs, existing,
+					)
+					results[idx] = encResult{node: encrypted, isPreKey: isPreKey, err: err}
+					if err == nil {
+						sessionReady = true
+					}
+				}()
+			}
+		}(group)
 	}
 	wg.Wait()
 
