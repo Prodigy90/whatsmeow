@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -347,5 +348,37 @@ func TestPutMessageSecretsDropsIncompleteEntries(t *testing.T) {
 	}
 	if len(state.execs) != 0 {
 		t.Fatalf("expected no statement when every entry is incomplete, got %d", len(state.execs))
+	}
+}
+
+func TestPutMessageSecretsChunkedPathDropsIncompleteEntries(t *testing.T) {
+	state := &recordingDB{}
+	s := newRecordingStore(t, "postgres", state)
+
+	chat := types.NewJID("120363000000000000", types.GroupServer)
+	sender := types.NewJID("15550000001", types.DefaultUserServer)
+	inserts := make([]store.MessageSecretInsert, 0, msgSecretsBatchSize+11)
+	for i := 0; i < msgSecretsBatchSize+1; i++ {
+		inserts = append(inserts, store.MessageSecretInsert{Chat: chat, Sender: sender, ID: types.MessageID("OK" + strconv.Itoa(i)), Secret: []byte("k")})
+	}
+	// Incomplete entries interleaved past the chunk boundary must not count
+	// towards it or reach the database.
+	for i := 0; i < 10; i++ {
+		inserts = append(inserts, store.MessageSecretInsert{Chat: chat, Sender: types.EmptyJID, ID: types.MessageID("BAD" + strconv.Itoa(i)), Secret: []byte("k")})
+	}
+	if err := s.PutMessageSecrets(context.Background(), inserts); err != nil {
+		t.Fatalf("PutMessageSecrets: %v", err)
+	}
+	if state.begins != 1 {
+		t.Errorf("expected the chunked path to use one transaction, got %d begins", state.begins)
+	}
+	if len(state.execs) != 2 {
+		t.Fatalf("expected 2 chunk statements, got %d", len(state.execs))
+	}
+	if got, want := len(state.execs[0].args), 1+4*msgSecretsBatchSize; got != want {
+		t.Errorf("first chunk: expected %d args, got %d", want, got)
+	}
+	if got, want := len(state.execs[1].args), 1+4*1; got != want {
+		t.Errorf("second chunk: expected %d args (1 valid row), got %d", want, got)
 	}
 }
