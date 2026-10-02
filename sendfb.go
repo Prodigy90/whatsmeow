@@ -559,7 +559,9 @@ func (cli *Client) encryptMessageForDevicesV3(
 		unlockSessions = func() {}
 		bundles = cli.fetchPreKeysNoError(ctx, retryDevices)
 		unlockSessions = cli.Store.LockSessions(sessionAddresses)
-		existingSessions, ctx, err = cli.Store.WithCachedSessions(baseCtx, sessionAddresses)
+		// Only the refreshed ctx matters here: bundles were already fetched for
+		// every device that lacked a session, so the re-read map goes unused.
+		_, ctx, err = cli.Store.WithCachedSessions(baseCtx, sessionAddresses)
 		if err != nil {
 			return nil, fmt.Errorf("failed to prefetch sessions: %w", err)
 		}
