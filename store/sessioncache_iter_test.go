@@ -19,6 +19,7 @@ import (
 	"go.mau.fi/libsignal/keys/root"
 	"go.mau.fi/libsignal/protocol"
 	"go.mau.fi/libsignal/state/record"
+
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
