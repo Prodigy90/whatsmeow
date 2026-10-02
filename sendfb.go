@@ -559,7 +559,11 @@ func (cli *Client) encryptMessageForDevicesV3(
 		unlockSessions = func() {}
 		bundles = cli.fetchPreKeysNoError(ctx, retryDevices)
 		unlockSessions = cli.Store.LockSessions(sessionAddresses)
-		existingSessions, ctx, err = cli.Store.WithCachedSessions(baseCtx, sessionAddresses)
+		// The re-read map is not consulted: a bundle fetched while unlocked is
+		// still processed even if a session appeared for that device meanwhile,
+		// replacing it. Same gap as encryptMessageForDevices in send.go (inherited
+		// from upstream PR #1168's design); tracked separately.
+		_, ctx, err = cli.Store.WithCachedSessions(baseCtx, sessionAddresses)
 		if err != nil {
 			return nil, fmt.Errorf("failed to prefetch sessions: %w", err)
 		}

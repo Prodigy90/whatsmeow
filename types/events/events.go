@@ -41,6 +41,11 @@ type QR struct {
 	Codes []string
 }
 
+type RotateADVSecret struct {
+	OldSecret string
+	NewSecret string
+}
+
 // PairSuccess is emitted after the QR code has been scanned with the phone and the handshake has
 // been completed. Note that this is generally followed by a websocket reconnection, so you should
 // wait for the Connected before trying to send anything.
@@ -515,10 +520,10 @@ type GroupInfo struct {
 	Join  []types.JID // Users who joined or were added the group
 	Leave []types.JID // Users who left or were removed from the group
 
-	Promote        []types.JID // Users who were promoted to admins
-	Demote         []types.JID // Users who were demoted to normal users
-	Suspended      bool        // whether the group is suspended
-	Unsuspended    bool        // whether the group is unsuspended
+	Promote     []types.JID // Users who were promoted to admins
+	Demote      []types.JID // Users who were demoted to normal users
+	Suspended   bool        // whether the group is suspended
+	Unsuspended bool        // whether the group is unsuspended
 
 	MembershipRequestsCreated []types.JID // Users that created membership (join) requests
 	MembershipRequestsRevoked []types.JID // Users whose membership requests were revoked/deleted

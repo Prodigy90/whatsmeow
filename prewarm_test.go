@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"go.mau.fi/libsignal/keys/prekey"
+
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"go.mau.fi/whatsmeow/store"
