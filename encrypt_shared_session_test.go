@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -121,6 +122,9 @@ func (s *fixedLIDStore) GetManyLIDsForPNs(_ context.Context, pns []types.JID) (m
 // two messages must carry consecutive chain counters; concurrently they can
 // read the same chain key and repeat a counter, which the recipient rejects.
 func TestEncryptForDevicesSerializesSharedSession(t *testing.T) {
+	// The old per-JID fan-out was capped at GOMAXPROCS workers; on a 1-CPU
+	// runner it ran sequentially and this test passed against the bug.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
 	ctx := context.Background()
 	ownPN := types.NewJID("2340000000000", types.DefaultUserServer)
 	pnDev := types.JID{User: "2348000000001", Server: types.DefaultUserServer}
@@ -174,6 +178,45 @@ func TestEncryptForDevicesSerializesSharedSession(t *testing.T) {
 	}
 }
 
+func newEncryptTestDevice(pnDev, lidDev types.JID) (*Client, *store.Device) {
+	ownPN := types.NewJID("2340000000000", types.DefaultUserServer)
+	dev := &store.Device{
+		ID:             &ownPN,
+		LID:            types.NewJID("999999999999999", types.HiddenUserServer),
+		IdentityKey:    keys.NewKeyPair(),
+		RegistrationID: 4242,
+		Log:            waLog.Noop,
+		Sessions:       &memSessionStore{m: map[string][]byte{}},
+		Identities:     &memIdentityStore{m: map[string][32]byte{}},
+		LIDs:           &fixedLIDStore{pnToLID: map[types.JID]types.JID{pnDev: lidDev}},
+	}
+	return &Client{Store: dev, Log: waLog.Noop}, dev
+}
+
+// remoteBundle is a prekey bundle for one fake remote device, using one-time
+// prekey preKeyID so a test can tell which bundle a session was built from.
+func remoteBundle(remoteIdentity *keys.KeyPair, preKeyID uint32) *prekey.Bundle {
+	signed := remoteIdentity.CreateSignedPreKey(1)
+	oneTime := keys.NewPreKey(preKeyID)
+	return prekey.NewBundle(1234, 0,
+		optional.NewOptionalUint32(oneTime.KeyID), signed.KeyID,
+		ecc.NewDjbECPublicKey(*oneTime.Pub), ecc.NewDjbECPublicKey(*signed.Pub), *signed.Signature,
+		identity.NewKey(ecc.NewDjbECPublicKey(*remoteIdentity.Pub)))
+}
+
+func pkmsgOf(t *testing.T, r encResult) *protocol.PreKeySignalMessage {
+	t.Helper()
+	if r.err != nil {
+		t.Fatalf("encrypt failed: %v", r.err)
+	}
+	enc := r.node.GetChildren()[0]
+	msg, err := protocol.NewPreKeySignalMessageFromBytes(enc.Content.([]byte), pbSerializer.PreKeySignalMessage, pbSerializer.SignalMessage)
+	if err != nil {
+		t.Fatalf("parse pkmsg: %v", err)
+	}
+	return msg
+}
+
 func TestGroupDevicesBySession(t *testing.T) {
 	pnA := types.JID{User: "2348000000001", Server: types.DefaultUserServer}
 	lidA := types.JID{User: "111111111111111", Server: types.HiddenUserServer}
@@ -181,29 +224,83 @@ func TestGroupDevicesBySession(t *testing.T) {
 	own := types.JID{User: "2340000000000", Server: types.DefaultUserServer, Device: 1}
 
 	all := []types.JID{pnA, pnB, own, lidA}
-	plaintexts := [][]byte{{1}, {1}, nil, {1}} // own device skipped
-	enc := map[types.JID]types.JID{pnA: lidA, lidA: lidA, pnB: pnB, own: own}
+	plaintexts := [][]byte{{1}, {1}, nil, {1}} // own device has nothing to encrypt
+	addrs := []string{lidA.SignalAddress().String(), pnB.SignalAddress().String(), own.SignalAddress().String(), lidA.SignalAddress().String()}
 	// addrToJID keeps the LAST JID per address: lidA for A's session. That JID
 	// holds the prekey bundle, so it must be encrypted first in its group.
-	addrToJID := map[string]types.JID{
-		lidA.SignalAddress().String(): lidA,
-		pnB.SignalAddress().String():  pnB,
-		own.SignalAddress().String():  own,
-	}
+	addrToJID := map[string]types.JID{addrs[0]: lidA, addrs[1]: pnB, addrs[2]: own}
 
-	got := groupDevicesBySession(all, plaintexts, enc, addrToJID)
+	groups, skipped := groupDevicesBySession(plaintexts, addrs, all, addrToJID)
+	if len(skipped) != 1 || skipped[0] != 2 {
+		t.Fatalf("skipped = %v, want [2]", skipped)
+	}
 	want := [][]int{{3, 0}, {1}}
-	if len(got) != len(want) {
-		t.Fatalf("got %d groups %v, want %v", len(got), got, want)
+	if len(groups) != len(want) {
+		t.Fatalf("groups = %v, want %v", groups, want)
 	}
 	for g := range want {
-		if len(got[g]) != len(want[g]) {
-			t.Fatalf("group %d = %v, want %v", g, got[g], want[g])
+		if len(groups[g]) != len(want[g]) || groups[g][0] != want[g][0] || groups[g][len(want[g])-1] != want[g][len(want[g])-1] {
+			t.Fatalf("groups = %v, want %v (bundle holder first)", groups, want)
 		}
-		for k := range want[g] {
-			if got[g][k] != want[g][k] {
-				t.Fatalf("group %d = %v, want %v (bundle holder first, skipped devices excluded)", g, got[g], want[g])
-			}
-		}
+	}
+}
+
+// TestEncryptSessionGroupBuildsMissingSessionOnce: no session yet, the bundle is
+// keyed under the LID JID (the holder). The holder must build the session and
+// the PN sibling must reuse it, so both get a node with consecutive counters.
+func TestEncryptSessionGroupBuildsMissingSessionOnce(t *testing.T) {
+	ctx := context.Background()
+	pnDev := types.JID{User: "2348000000001", Server: types.DefaultUserServer}
+	lidDev := types.JID{User: "111111111111111", Server: types.HiddenUserServer}
+	cli, _ := newEncryptTestDevice(pnDev, lidDev)
+
+	all := []types.JID{pnDev, lidDev}
+	addr := lidDev.SignalAddress().String()
+	addrs := []string{addr, addr}
+	plaintexts := [][]byte{[]byte("hi"), []byte("hi")}
+	enc := map[types.JID]types.JID{pnDev: lidDev, lidDev: lidDev}
+	bundles := map[types.JID]*prekey.Bundle{lidDev: remoteBundle(keys.NewKeyPair(), 7)}
+	groups, _ := groupDevicesBySession(plaintexts, addrs, all, map[string]types.JID{addr: lidDev})
+	if len(groups) != 1 {
+		t.Fatalf("groups = %v, want one session group", groups)
+	}
+
+	results := make([]encResult, len(all))
+	cli.encryptSessionGroup(ctx, groups[0], all, plaintexts, addrs, enc, bundles, map[string]bool{addr: false}, waBinary.Attrs{}, results)
+
+	a, b := pkmsgOf(t, results[0]), pkmsgOf(t, results[1])
+	if a.WhisperMessage().Counter() == b.WhisperMessage().Counter() {
+		t.Fatalf("both messages carry counter %d", a.WhisperMessage().Counter())
+	}
+	if a.BaseKey().Serialize() == nil || string(a.BaseKey().Serialize()) != string(b.BaseKey().Serialize()) {
+		t.Fatal("the two messages were built on different sessions: the sibling re-processed the bundle")
+	}
+}
+
+// TestEncryptSessionGroupKeepsSessionThatAppearedDuringFetch covers ticket 03:
+// a session was established (from one-time prekey 7) while the locks were
+// released for the prekey fetch, and the fetched bundle (prekey 9) is stale. The
+// re-read says the session exists, so the bundle must not be processed over it.
+func TestEncryptSessionGroupKeepsSessionThatAppearedDuringFetch(t *testing.T) {
+	ctx := context.Background()
+	pnDev := types.JID{User: "2348000000001", Server: types.DefaultUserServer}
+	lidDev := types.JID{User: "111111111111111", Server: types.HiddenUserServer}
+	cli, dev := newEncryptTestDevice(pnDev, lidDev)
+
+	remote := keys.NewKeyPair()
+	if err := session.NewBuilderFromSignal(dev, lidDev.SignalAddress(), pbSerializer).ProcessBundle(ctx, remoteBundle(remote, 7)); err != nil {
+		t.Fatalf("establish session: %v", err)
+	}
+
+	all := []types.JID{lidDev}
+	addr := lidDev.SignalAddress().String()
+	results := make([]encResult, 1)
+	cli.encryptSessionGroup(ctx, []int{0}, all, [][]byte{[]byte("hi")}, []string{addr},
+		map[types.JID]types.JID{lidDev: lidDev},
+		map[types.JID]*prekey.Bundle{lidDev: remoteBundle(remote, 9)},
+		map[string]bool{addr: true}, waBinary.Attrs{}, results)
+
+	if id := pkmsgOf(t, results[0]).PreKeyID(); id == nil || id.Value != 7 {
+		t.Fatalf("message built on prekey %v, want 7: the stale bundle overwrote the existing session", id)
 	}
 }
