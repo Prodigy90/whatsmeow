@@ -1483,13 +1483,6 @@ func (cli *Client) encryptMessageForDevices(
 		}
 	}
 
-	type encResult struct {
-		node     *waBinary.Node
-		isPreKey bool
-		skip     bool
-		err      error
-	}
-
 	// Pre-compute plaintexts and mark skipped devices
 	plaintexts := make([][]byte, len(allDevices))
 	for i, jid := range allDevices {
@@ -1510,29 +1503,27 @@ func (cli *Client) encryptMessageForDevices(
 	sem := make(chan struct{}, workers)
 	results := make([]encResult, len(allDevices))
 
-	cli.Log.Debugf("Encrypting for %d devices (%d need prekey bundles), workers=%d", len(allDevices), len(retryDevices), workers)
+	// One goroutine per Signal SESSION, not per JID. Several JIDs can resolve to
+	// one session: a device listed in both PN and LID form maps to its LID
+	// session, and a self-send lists our own devices twice. Two goroutines on one
+	// session record both read the same chain key and emit messages with the same
+	// counter, which the recipient drops ("Waiting for this message").
+	groups, skipped := groupDevicesBySession(plaintexts, sessionAddresses, allDevices, sessionAddressToJID)
+	for _, idx := range skipped {
+		results[idx] = encResult{skip: true}
+	}
+
+	cli.Log.Debugf("Encrypting for %d devices in %d sessions (%d need prekey bundles), workers=%d", len(allDevices), len(groups), len(retryDevices), workers)
 	encryptStart := time.Now()
 	var wg sync.WaitGroup
-	for i, jid := range allDevices {
-		if plaintexts[i] == nil {
-			results[i] = encResult{skip: true}
-			continue
-		}
+	for _, group := range groups {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(idx int, j types.JID, pt []byte) {
+		go func(idxs []int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			defer func() {
-				if r := recover(); r != nil {
-					results[idx] = encResult{err: fmt.Errorf("panic encrypting for %s: %v\n%s", j, r, debug.Stack())}
-				}
-			}()
-			encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
-				ctx, pt, j, encryptionIdentities[j], bundles[j], encAttrs, existingSessions,
-			)
-			results[idx] = encResult{node: encrypted, isPreKey: isPreKey, err: err}
-		}(i, jid, plaintexts[i])
+			cli.encryptSessionGroup(ctx, idxs, allDevices, plaintexts, sessionAddresses, encryptionIdentities, bundles, existingSessions, encAttrs, results)
+		}(group)
 	}
 	wg.Wait()
 
@@ -1589,6 +1580,97 @@ func (cli *Client) encryptMessageForDevices(
 		len(allDevices), encryptDur, flushDur, failCount, includeIdentity)
 
 	return participantNodes, includeIdentity, nil
+}
+
+type encResult struct {
+	node     *waBinary.Node
+	isPreKey bool
+	skip     bool
+	err      error
+}
+
+// groupDevicesBySession partitions the indexes of allDevices that need
+// encrypting (non-nil plaintext) by the Signal session address they encrypt
+// against (sessionAddresses, index-aligned with allDevices), and returns the
+// indexes with nothing to encrypt separately. Inside a group allDevices order
+// is kept, except that the JID the prekey bundles are keyed under
+// (sessionAddressToJID, the last JID seen for the address) goes first, so a
+// missing session is built before its siblings use it. Upstream's sequential
+// loop has no such ordering: there a sibling listed before the bundle holder
+// fails with ErrNoSession, here it gets a node from the session just built.
+func groupDevicesBySession(
+	plaintexts [][]byte,
+	sessionAddresses []string,
+	allDevices []types.JID,
+	sessionAddressToJID map[string]types.JID,
+) (groups [][]int, skipped []int) {
+	order := make([]string, 0, len(allDevices))
+	byAddr := make(map[string][]int, len(allDevices))
+	for i, jid := range allDevices {
+		if plaintexts[i] == nil {
+			skipped = append(skipped, i)
+			continue
+		}
+		addr := sessionAddresses[i]
+		if _, ok := byAddr[addr]; !ok {
+			order = append(order, addr)
+		}
+		if sessionAddressToJID[addr] == jid {
+			byAddr[addr] = append([]int{i}, byAddr[addr]...)
+		} else {
+			byAddr[addr] = append(byAddr[addr], i)
+		}
+	}
+	groups = make([][]int, 0, len(order))
+	for _, addr := range order {
+		groups = append(groups, byAddr[addr])
+	}
+	return groups, skipped
+}
+
+// encryptSessionGroup encrypts, in order, every JID of one Signal session and
+// writes each outcome to results[idx]. Must be the only goroutine touching that
+// session. A bundle is only processed when the session does not exist after the
+// re-read: one that appeared while the locks were released for the prekey fetch
+// (an inbound pkmsg, say) is used rather than overwritten. Once a JID in the
+// group has encrypted, the rest reuse the session it built or advanced.
+func (cli *Client) encryptSessionGroup(
+	ctx context.Context,
+	idxs []int,
+	allDevices []types.JID,
+	plaintexts [][]byte,
+	sessionAddresses []string,
+	encryptionIdentities map[types.JID]types.JID,
+	bundles map[types.JID]*prekey.Bundle,
+	existingSessions map[string]bool,
+	encAttrs waBinary.Attrs,
+	results []encResult,
+) {
+	sessionReady := false
+	for _, idx := range idxs {
+		j := allDevices[idx]
+		addr := sessionAddresses[idx]
+		existing := existingSessions
+		bundle := bundles[j]
+		if sessionReady || existingSessions[addr] {
+			existing = map[string]bool{addr: true}
+			bundle = nil
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					results[idx] = encResult{err: fmt.Errorf("panic encrypting for %s: %v\n%s", j, r, debug.Stack())}
+				}
+			}()
+			encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
+				ctx, plaintexts[idx], j, encryptionIdentities[j], bundle, encAttrs, existing,
+			)
+			results[idx] = encResult{node: encrypted, isPreKey: isPreKey, err: err}
+			if err == nil {
+				sessionReady = true
+			}
+		}()
+	}
 }
 
 func (cli *Client) encryptMessageForDeviceAndWrap(
