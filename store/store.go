@@ -225,6 +225,14 @@ type DeviceListEntry struct {
 // hold multiple accounts. Implementations must persist only non-empty device lists
 // and should treat every operation as best-effort cache maintenance — a failure
 // must not break a send or a device lookup (callers log and continue).
+// IdleCacheReleaser is implemented by stores that keep a rebuildable in-memory
+// cache in front of the database. ReleaseCache drops that cache and reports how
+// many entries it held; later reads fall through to the database and refill it.
+// Used by Client.ReleaseIdleCaches.
+type IdleCacheReleaser interface {
+	ReleaseCache() int
+}
+
 type DeviceListStore interface {
 	// PutManyDeviceLists upserts a batch of device-list entries for ourJID.
 	PutManyDeviceLists(ctx context.Context, ourJID types.JID, entries []DeviceListEntry) error
