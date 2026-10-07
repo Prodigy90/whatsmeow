@@ -34,6 +34,7 @@ type CachedLIDMap struct {
 }
 
 var _ store.LIDStore = (*CachedLIDMap)(nil)
+var _ store.IdleCacheReleaser = (*CachedLIDMap)(nil)
 
 func NewCachedLIDMap(db *dbutil.Database) *CachedLIDMap {
 	return &CachedLIDMap{
@@ -75,6 +76,19 @@ func (s *CachedLIDMap) FillCache(ctx context.Context) error {
 	err := s.scanManyLids(res, nil)
 	s.cacheFilled = err == nil
 	return err
+}
+
+// ReleaseCache drops the in-memory PN↔LID maps and returns how many mappings
+// they held. It also clears cacheFilled: with it set, a miss would be read as
+// "no mapping" instead of falling through to the database.
+func (s *CachedLIDMap) ReleaseCache() int {
+	s.lidCacheLock.Lock()
+	defer s.lidCacheLock.Unlock()
+	n := len(s.pnToLIDCache)
+	s.pnToLIDCache = make(map[string]string)
+	s.lidToPNCache = make(map[string]string)
+	s.cacheFilled = false
+	return n
 }
 
 func (s *CachedLIDMap) scanManyLids(res dbutil.RowIter[store.LIDMapping], fn func(lid, pn string)) error {

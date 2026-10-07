@@ -14,6 +14,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -521,6 +522,7 @@ func (cli *Client) getUserDevicesReportingSync(ctx context.Context, jids []types
 	if cli == nil {
 		return nil, false, ErrClientIsNil
 	}
+	cli.lastDeviceListUse.Store(time.Now().UnixNano())
 	cli.userDevicesCacheLock.Lock()
 	defer cli.userDevicesCacheLock.Unlock()
 

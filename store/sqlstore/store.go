@@ -70,6 +70,7 @@ func NewSQLStore(c *Container, jid types.JID) *SQLStore {
 }
 
 var _ store.AllSessionSpecificStores = (*SQLStore)(nil)
+var _ store.IdleCacheReleaser = (*SQLStore)(nil)
 
 const (
 	putIdentityQuery = `
@@ -1149,6 +1150,16 @@ func (s *SQLStore) PutManyRedactedPhones(ctx context.Context, entries []store.Re
 	return nil
 }
 
+// ReleaseCache drops the in-memory contact cache and returns how many entries it
+// held. GetContact refills it from the database one contact at a time.
+func (s *SQLStore) ReleaseCache() int {
+	s.contactCacheLock.Lock()
+	defer s.contactCacheLock.Unlock()
+	n := len(s.contactCache)
+	s.contactCache = make(map[types.JID]*types.ContactInfo)
+	return n
+}
+
 func (s *SQLStore) getContact(ctx context.Context, user types.JID) (*types.ContactInfo, error) {
 	cached, ok := s.contactCache[user]
 	if ok {
@@ -1207,13 +1218,15 @@ var convertContactRow = dbutil.ConvertRowFn[*contactTuple](func(rows dbutil.Scan
 	}, nil
 })
 
+// GetAllContacts reads every contact from the database. Fork change: unlike
+// upstream it does not copy the rows into contactCache. Callers walk the result
+// once and drop it, but the cache kept the whole address book for the life of the
+// process (~14 MB at 50K contacts). GetContact still caches the contacts it is
+// actually asked about.
 func (s *SQLStore) GetAllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error) {
-	s.contactCacheLock.Lock()
-	defer s.contactCacheLock.Unlock()
-	output := make(map[types.JID]types.ContactInfo, len(s.contactCache))
+	output := make(map[types.JID]types.ContactInfo)
 	err := convertContactRow.NewRowIter(s.db.Query(ctx, getAllContactsQuery, s.JID)).Iter(func(tuple *contactTuple) (bool, error) {
 		output[tuple.JID] = *tuple.Info
-		s.contactCache[tuple.JID] = tuple.Info
 		return true, nil
 	})
 	return output, err

@@ -146,6 +146,9 @@ type Client struct {
 	groupCacheLock       sync.Mutex
 	userDevicesCache     map[types.JID]deviceCache
 	userDevicesCacheLock sync.Mutex
+	// lastDeviceListUse is when a send last resolved device lists (UnixNano). It
+	// tells ReleaseIdleCaches' caller whether the account has gone quiet.
+	lastDeviceListUse atomic.Int64
 
 	recentMessagesMap  map[recentMessageKey]RecentMessage
 	recentMessagesList [recentMessagesSize]recentMessageKey
