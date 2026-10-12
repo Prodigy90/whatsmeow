@@ -200,6 +200,11 @@ type Client struct {
 
 	SendReportingTokens bool
 
+	// GroupSendDropAsError makes SendMessage return ErrGroupSendDropped for a group send whose ack
+	// has no error and no `count` (the server dropped it). When false, such a send is logged at
+	// Warn ("group send ack without count") and reported as a success.
+	GroupSendDropAsError bool
+
 	BackgroundEventCtx context.Context
 
 	phoneLinkingCache    atomic.Pointer[phoneLinkingCache]

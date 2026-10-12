@@ -145,6 +145,12 @@ type SendResponse struct {
 
 	// The chat JID the message was actually sent to.
 	Chat types.JID
+
+	// The ack's `count` attribute: how many other members the server fanned a group message out to.
+	// Nil when the ack carried no `count`. Every delivered group send acks with a count (count="0"
+	// in a group where we are the only member); a non-admin send into an announce-only group is
+	// acked with no error and no count, and the server drops it. See ErrGroupSendDropped.
+	ServerCount *int
 }
 
 // SendRequestExtra contains the optional parameters for SendMessage.
@@ -485,20 +491,8 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			return
 		}
 	}
-	ag := respNode.AttrGetter()
-	resp.ServerID = types.MessageServerID(ag.OptionalInt("server_id"))
-	resp.Timestamp = ag.UnixTime("t")
-	if errorCode := ag.Int("error"); errorCode != 0 {
-		err = fmt.Errorf("%w %d", ErrServerReturnedError, errorCode)
-		resp.RawErrorResponse = respNode.String()
-		if rejected := ag.OptionalJID("participant"); rejected != nil {
-			resp.RejectedParticipant = *rejected
-		}
-		resp.BackoffSeconds = ag.OptionalInt("backoff")
-		cli.Log.Warnf("Server-returned error %d on send to %s (id=%s, phash=%s, rejected=%s, backoff=%d): %s",
-			errorCode, to, req.ID, phash, resp.RejectedParticipant, resp.BackoffSeconds, resp.RawErrorResponse)
-	}
-	expectedPHash := ag.OptionalString("phash")
+	err = cli.parseSendAck(respNode, to, req.ID, phash, message, &resp)
+	expectedPHash := respNode.AttrGetter().OptionalString("phash")
 	if len(expectedPHash) > 0 && phash != expectedPHash {
 		cli.Log.Warnf("Server returned different participant list hash (%s != %s) when sending to %s. Some devices may not have received the message.", phash, expectedPHash, to)
 		switch to.Server {
@@ -518,6 +512,37 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		}
 	}
 	return
+}
+
+// parseSendAck reads the server's <ack> for a sent message into resp and returns the send error,
+// if any: ErrServerReturnedError for an ack carrying an `error` code or, when GroupSendDropAsError
+// is set, ErrGroupSendDropped for a group ack with neither an error nor a `count`.
+func (cli *Client) parseSendAck(respNode *waBinary.Node, to types.JID, id types.MessageID, phash string, message *waE2E.Message, resp *SendResponse) error {
+	ag := respNode.AttrGetter()
+	resp.ServerID = types.MessageServerID(ag.OptionalInt("server_id"))
+	resp.Timestamp = ag.UnixTime("t")
+	if count, ok := ag.GetInt64("count", false); ok {
+		c := int(count)
+		resp.ServerCount = &c
+	}
+	if errorCode := ag.Int("error"); errorCode != 0 {
+		resp.RawErrorResponse = respNode.String()
+		if rejected := ag.OptionalJID("participant"); rejected != nil {
+			resp.RejectedParticipant = *rejected
+		}
+		resp.BackoffSeconds = ag.OptionalInt("backoff")
+		cli.Log.Warnf("Server-returned error %d on send to %s (id=%s, phash=%s, rejected=%s, backoff=%d): %s",
+			errorCode, to, id, phash, resp.RejectedParticipant, resp.BackoffSeconds, resp.RawErrorResponse)
+		return fmt.Errorf("%w %d", ErrServerReturnedError, errorCode)
+	}
+	if to.Server == types.GroupServer && resp.ServerCount == nil {
+		cli.Log.Warnf("group send ack without count: group=%s id=%s type=%s edit=%s drop_as_error=%t ack=%s",
+			to, id, getTypeFromMessage(message), getEditAttribute(message), cli.GroupSendDropAsError, respNode.String())
+		if cli.GroupSendDropAsError {
+			return ErrGroupSendDropped
+		}
+	}
+	return nil
 }
 
 func (cli *Client) SendPeerMessage(ctx context.Context, message *waE2E.Message) (SendResponse, error) {
