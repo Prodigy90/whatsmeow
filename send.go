@@ -145,6 +145,12 @@ type SendResponse struct {
 
 	// The chat JID the message was actually sent to.
 	Chat types.JID
+
+	// The ack's `count` attribute: how many other members the server fanned a group message out to.
+	// Nil when the ack carried no `count`. Every delivered group send acks with a count (count="0"
+	// in a group where we are the only member); a non-admin send into an announce-only group is
+	// acked with no error and no count, and the server drops it. See ErrGroupSendDropped.
+	ServerCount *int
 }
 
 // SendRequestExtra contains the optional parameters for SendMessage.
@@ -485,20 +491,8 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			return
 		}
 	}
-	ag := respNode.AttrGetter()
-	resp.ServerID = types.MessageServerID(ag.OptionalInt("server_id"))
-	resp.Timestamp = ag.UnixTime("t")
-	if errorCode := ag.Int("error"); errorCode != 0 {
-		err = fmt.Errorf("%w %d", ErrServerReturnedError, errorCode)
-		resp.RawErrorResponse = respNode.String()
-		if rejected := ag.OptionalJID("participant"); rejected != nil {
-			resp.RejectedParticipant = *rejected
-		}
-		resp.BackoffSeconds = ag.OptionalInt("backoff")
-		cli.Log.Warnf("Server-returned error %d on send to %s (id=%s, phash=%s, rejected=%s, backoff=%d): %s",
-			errorCode, to, req.ID, phash, resp.RejectedParticipant, resp.BackoffSeconds, resp.RawErrorResponse)
-	}
-	expectedPHash := ag.OptionalString("phash")
+	err = cli.parseSendAck(respNode, to, req.ID, phash, message, &resp)
+	expectedPHash := respNode.AttrGetter().OptionalString("phash")
 	if len(expectedPHash) > 0 && phash != expectedPHash {
 		cli.Log.Warnf("Server returned different participant list hash (%s != %s) when sending to %s. Some devices may not have received the message.", phash, expectedPHash, to)
 		switch to.Server {
@@ -518,6 +512,42 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		}
 	}
 	return
+}
+
+// parseSendAck reads the server's <ack> for a sent message into resp and returns the send error,
+// if any: ErrServerReturnedError for an ack carrying an `error` code or, when GroupSendDropAsError
+// is set, ErrGroupSendDropped for a group ack with neither an error nor a `count`.
+//
+// The drop check only covers plain content sends (see isPlainContentSend). A missing `count` has only
+// been observed, and only been shown to mean "dropped", for those; reactions, pins, edits, revokes,
+// poll votes and other protocol messages may ack differently, so they never warn or fail on it.
+// ServerCount is filled for every ack regardless.
+func (cli *Client) parseSendAck(respNode *waBinary.Node, to types.JID, id types.MessageID, phash string, message *waE2E.Message, resp *SendResponse) error {
+	ag := respNode.AttrGetter()
+	resp.ServerID = types.MessageServerID(ag.OptionalInt("server_id"))
+	resp.Timestamp = ag.UnixTime("t")
+	if count, ok := ag.GetInt64("count", false); ok {
+		c := int(count)
+		resp.ServerCount = &c
+	}
+	if errorCode := ag.Int("error"); errorCode != 0 {
+		resp.RawErrorResponse = respNode.String()
+		if rejected := ag.OptionalJID("participant"); rejected != nil {
+			resp.RejectedParticipant = *rejected
+		}
+		resp.BackoffSeconds = ag.OptionalInt("backoff")
+		cli.Log.Warnf("Server-returned error %d on send to %s (id=%s, phash=%s, rejected=%s, backoff=%d): %s",
+			errorCode, to, id, phash, resp.RejectedParticipant, resp.BackoffSeconds, resp.RawErrorResponse)
+		return fmt.Errorf("%w %d", ErrServerReturnedError, errorCode)
+	}
+	if to.Server == types.GroupServer && resp.ServerCount == nil && isPlainContentSend(message) {
+		cli.Log.Warnf("group send ack without count: group=%s id=%s type=%s drop_as_error=%t ack=%s",
+			to, id, getTypeFromMessage(message), cli.GroupSendDropAsError, respNode.String())
+		if cli.GroupSendDropAsError {
+			return ErrGroupSendDropped
+		}
+	}
+	return nil
 }
 
 func (cli *Client) SendPeerMessage(ctx context.Context, message *waE2E.Message) (SendResponse, error) {
@@ -989,6 +1019,44 @@ func getTypeFromMessage(msg *waE2E.Message) string {
 	default:
 		return "text"
 	}
+}
+
+// isPlainContentSend reports whether msg is new content posted into a chat (text, media, poll
+// creation, sticker, ...), as opposed to an action on an existing message: anything carrying an
+// edit attribute (edit, revoke, pin, reaction removal), a reaction, a poll vote, or a protocol /
+// keep-in-chat message. Wrappers (ephemeral, view once, document with caption) are looked through.
+func isPlainContentSend(msg *waE2E.Message) bool {
+	if msg == nil || getEditAttribute(msg) != types.EditAttributeEmpty || getTypeFromMessage(msg) == "reaction" {
+		return false
+	}
+	return isPlainContentInner(msg)
+}
+
+func isPlainContentInner(msg *waE2E.Message) bool {
+	switch {
+	case msg == nil:
+		return false
+	case msg.ViewOnceMessage != nil:
+		return isPlainContentInner(msg.ViewOnceMessage.Message)
+	case msg.ViewOnceMessageV2 != nil:
+		return isPlainContentInner(msg.ViewOnceMessageV2.Message)
+	case msg.ViewOnceMessageV2Extension != nil:
+		return isPlainContentInner(msg.ViewOnceMessageV2Extension.Message)
+	case msg.LottieStickerMessage != nil:
+		return isPlainContentInner(msg.LottieStickerMessage.Message)
+	case msg.EphemeralMessage != nil:
+		return isPlainContentInner(msg.EphemeralMessage.Message)
+	case msg.DocumentWithCaptionMessage != nil:
+		return isPlainContentInner(msg.DocumentWithCaptionMessage.Message)
+	// Edits, revokes and pins are already caught by their edit attribute and reactions by type; these
+	// are the remaining non-content kinds, which carry no edit attribute.
+	case msg.PollUpdateMessage != nil,
+		msg.ProtocolMessage != nil,
+		msg.KeepInChatMessage != nil,
+		msg.EditedMessage != nil:
+		return false
+	}
+	return true
 }
 
 func getMediaTypeFromMessage(msg *waE2E.Message) string {
