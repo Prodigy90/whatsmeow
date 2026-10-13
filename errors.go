@@ -111,8 +111,8 @@ var (
 	ErrRecipientADJID           = errors.New("message recipient must be a user JID with no device part")
 	ErrServerReturnedError      = errors.New("server returned error")
 	ErrInvalidInlineBotID       = errors.New("invalid inline bot ID")
-	// ErrGroupSendDropped is returned (only when Client.GroupSendDropAsError is set) for a group send
-	// the server acked with no error and no `count`: it accepted the message and delivered it to no one.
+	// ErrGroupSendDropped is returned (only when Client.GroupSendDropAsError is set) for a plain content
+	// group send (not a reaction, pin, edit, revoke or poll vote) the server acked with no error and no `count`: it accepted the message and delivered it to no one.
 	// In practice this is a non-admin sending into an announce-only (admins-only) group.
 	ErrGroupSendDropped = errors.New("server accepted the group message but delivered it to no one")
 )
