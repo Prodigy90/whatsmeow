@@ -888,10 +888,7 @@ func (cli *Client) sendGroup(
 	skMsg := waBinary.Node{
 		Tag:     "enc",
 		Content: ciphertext,
-		Attrs:   waBinary.Attrs{"v": "2", "type": "skmsg"},
-	}
-	if mediaType := getMediaTypeFromMessage(message); mediaType != "" {
-		skMsg.Attrs["mediatype"] = mediaType
+		Attrs:   senderKeyEncAttrs(message),
 	}
 	node.Content = append(node.GetChildren(), skMsg)
 	if cli.shouldIncludeReportingToken(message) && message.GetMessageContextInfo().GetMessageSecret() != nil {
@@ -905,6 +902,23 @@ func (cli *Client) sendGroup(
 		return "", nil, fmt.Errorf("failed to send message node: %w", err)
 	}
 	return phash, data, nil
+}
+
+// senderKeyEncAttrs returns the attributes of a group message's skmsg <enc> node.
+//
+// A pin (edit="2") carries decrypt-fail="hide" on its skmsg, as WA Web sends it
+// (captured 2026-10-12: `<message type="text" edit="2"><enc v="2" type="skmsg"
+// decrypt-fail="hide"/>`). Other edit kinds are left alone: WA Web's own admin
+// revoke (edit="8") goes out with a bare skmsg in the same capture.
+func senderKeyEncAttrs(message *waE2E.Message) waBinary.Attrs {
+	attrs := waBinary.Attrs{"v": "2", "type": "skmsg"}
+	if mediaType := getMediaTypeFromMessage(message); mediaType != "" {
+		attrs["mediatype"] = mediaType
+	}
+	if getEditAttribute(message) == types.EditAttributePinInChat {
+		attrs["decrypt-fail"] = string(events.DecryptFailHide)
+	}
+	return attrs
 }
 
 func (cli *Client) sendPeerMessage(
