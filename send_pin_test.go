@@ -57,11 +57,14 @@ func TestPinStanzaAttributes(t *testing.T) {
 		}
 	}
 
+	// INFERRED, not captured: only PIN_FOR_ALL went out in the 2026-10-12 capture.
+	// An unpin carries the same edit="2" (getEditAttribute keys on
+	// PinInChatMessage, not its type), so it is assumed to need the same skmsg.
 	unpin := capturedPin()
 	unpin.PinInChatMessage.Type = waE2E.PinInChatMessage_UNPIN_FOR_ALL.Enum()
 	unpin.MessageContextInfo.MessageAddOnDurationInSecs = proto.Uint32(0)
 	if senderKeyEncAttrs(unpin)["decrypt-fail"] != "hide" {
-		t.Fatal("an unpin is a pin-in-chat message too: its skmsg must carry decrypt-fail=hide")
+		t.Fatal("an unpin is a pin-in-chat message too: its skmsg carries decrypt-fail=hide (inferred, not captured)")
 	}
 }
 
