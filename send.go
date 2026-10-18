@@ -87,6 +87,9 @@ type MessageDebugTimings struct {
 	GetDevices      time.Duration
 	GroupEncrypt    time.Duration
 	PeerEncrypt     time.Duration
+	// SessionFlush is the part of PeerEncrypt spent saving the advanced Signal
+	// sessions and identities to the store before the message is sent.
+	SessionFlush time.Duration
 
 	Send  time.Duration
 	Resp  time.Duration
@@ -1363,8 +1366,8 @@ func (cli *Client) prepareMessageNode(
 	}
 
 	start = time.Now()
-	participantNodes, includeIdentity, err := cli.encryptMessageForDevices(
-		ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs,
+	participantNodes, includeIdentity, err := cli.encryptMessageForDevicesTimed(
+		ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs, &timings.SessionFlush,
 	)
 	timings.PeerEncrypt = time.Since(start)
 	if err != nil {
@@ -1493,6 +1496,19 @@ func (cli *Client) encryptMessageForDevices(
 	id string,
 	msgPlaintext, dsmPlaintext []byte,
 	encAttrs waBinary.Attrs,
+) ([]waBinary.Node, bool, error) {
+	return cli.encryptMessageForDevicesTimed(ctx, allDevices, id, msgPlaintext, dsmPlaintext, encAttrs, nil)
+}
+
+// encryptMessageForDevicesTimed is encryptMessageForDevices that also reports,
+// through flushDurOut when non-nil, how long the session/identity flush took.
+func (cli *Client) encryptMessageForDevicesTimed(
+	ctx context.Context,
+	allDevices []types.JID,
+	id string,
+	msgPlaintext, dsmPlaintext []byte,
+	encAttrs waBinary.Attrs,
+	flushDurOut *time.Duration,
 ) ([]waBinary.Node, bool, error) {
 	ownJID := cli.getOwnID()
 	ownLID := cli.getOwnLID()
@@ -1644,6 +1660,9 @@ func (cli *Client) encryptMessageForDevices(
 		return nil, false, fmt.Errorf("failed to save cached identities: %w", err)
 	}
 	flushDur := time.Since(flushStart)
+	if flushDurOut != nil {
+		*flushDurOut = flushDur
+	}
 
 	var failCount int
 	for _, r := range results {
