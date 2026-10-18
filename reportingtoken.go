@@ -40,7 +40,10 @@ func (cli *Client) shouldIncludeReportingToken(message *waE2E.Message) bool {
 	if !cli.SendReportingTokens {
 		return false
 	}
+	// No pins: WA Web sends a pin with no <reporting> node and no message secret
+	// (captured 2026-10-12), and this check also decides whether SendMessage adds one.
 	return message.ReactionMessage == nil &&
+		message.PinInChatMessage == nil &&
 		message.EncReactionMessage == nil &&
 		message.EncEventResponseMessage == nil &&
 		message.PollUpdateMessage == nil
