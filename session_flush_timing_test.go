@@ -35,7 +35,6 @@ func (s *slowFlushSessionStore) PutManySessions(ctx context.Context, m map[strin
 	return s.memSessionStore.PutManySessions(ctx, m)
 }
 
-
 // TestEncryptForDevicesReportsSessionFlush checks that the session flush time
 // reaches the caller: the worker's status-send timing log reads it from
 // MessageDebugTimings.SessionFlush to tell store writes apart from crypto.
