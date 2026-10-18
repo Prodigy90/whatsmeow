@@ -87,6 +87,9 @@ type MessageDebugTimings struct {
 	GetDevices      time.Duration
 	GroupEncrypt    time.Duration
 	PeerEncrypt     time.Duration
+	// SessionFlush is the part of PeerEncrypt spent saving the advanced Signal
+	// sessions and identities to the store before the message is sent.
+	SessionFlush time.Duration
 
 	Send  time.Duration
 	Resp  time.Duration
@@ -107,6 +110,9 @@ func (mdt MessageDebugTimings) MarshalZerologObject(evt *zerolog.Event) {
 		evt.Dur("group_encrypt", mdt.GroupEncrypt)
 	}
 	evt.Dur("peer_encrypt", mdt.PeerEncrypt)
+	if mdt.SessionFlush != 0 {
+		evt.Dur("session_flush", mdt.SessionFlush)
+	}
 	evt.Dur("send", mdt.Send)
 	evt.Dur("resp", mdt.Resp)
 	if mdt.Retry != 0 {
@@ -1363,8 +1369,8 @@ func (cli *Client) prepareMessageNode(
 	}
 
 	start = time.Now()
-	participantNodes, includeIdentity, err := cli.encryptMessageForDevices(
-		ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs,
+	participantNodes, includeIdentity, err := cli.encryptMessageForDevicesTimed(
+		ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs, &timings.SessionFlush,
 	)
 	timings.PeerEncrypt = time.Since(start)
 	if err != nil {
@@ -1493,6 +1499,19 @@ func (cli *Client) encryptMessageForDevices(
 	id string,
 	msgPlaintext, dsmPlaintext []byte,
 	encAttrs waBinary.Attrs,
+) ([]waBinary.Node, bool, error) {
+	return cli.encryptMessageForDevicesTimed(ctx, allDevices, id, msgPlaintext, dsmPlaintext, encAttrs, nil)
+}
+
+// encryptMessageForDevicesTimed is encryptMessageForDevices that also reports,
+// through flushDurOut when non-nil, how long the session/identity flush took.
+func (cli *Client) encryptMessageForDevicesTimed(
+	ctx context.Context,
+	allDevices []types.JID,
+	id string,
+	msgPlaintext, dsmPlaintext []byte,
+	encAttrs waBinary.Attrs,
+	flushDurOut *time.Duration,
 ) ([]waBinary.Node, bool, error) {
 	ownJID := cli.getOwnID()
 	ownLID := cli.getOwnLID()
@@ -1635,15 +1654,24 @@ func (cli *Client) encryptMessageForDevices(
 	// values, so logging/tracing still works.
 	flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer flushCancel()
-	err = cli.Store.PutCachedSessions(flushCtx)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to save cached sessions: %w", err)
-	}
-	err = cli.Store.PutCachedIdentities(flushCtx)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to save cached identities: %w", err)
-	}
+	flushErr := func() error {
+		if err := cli.Store.PutCachedSessions(flushCtx); err != nil {
+			return fmt.Errorf("failed to save cached sessions: %w", err)
+		}
+		if err := cli.Store.PutCachedIdentities(flushCtx); err != nil {
+			return fmt.Errorf("failed to save cached identities: %w", err)
+		}
+		return nil
+	}()
 	flushDur := time.Since(flushStart)
+	// Reported on failure too: a flush that times out is the case this timing
+	// exists to show.
+	if flushDurOut != nil {
+		*flushDurOut = flushDur
+	}
+	if flushErr != nil {
+		return nil, false, flushErr
+	}
 
 	var failCount int
 	for _, r := range results {
