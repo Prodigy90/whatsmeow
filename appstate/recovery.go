@@ -67,8 +67,9 @@ func (proc *Processor) ProcessRecovery(ctx context.Context, recovery *waSyncdSna
 			return nil, fmt.Errorf("failed to unmarshal index for mutation #%d: %w", i+1, err)
 		}
 		macs[i] = store.AppStateMutationMAC{
-			IndexMAC: concatAndHMAC(sha256.New, keys.Index, mutation.GetValue().GetIndex()),
-			ValueMAC: mutation.GetMac(),
+			IndexMAC:  concatAndHMAC(sha256.New, keys.Index, mutation.GetValue().GetIndex()),
+			ValueMAC:  mutation.GetMac(),
+			IndexHash: indexHash(mutation.GetValue().GetIndex()),
 		}
 		mutations[i] = Mutation{
 			KeyID:        mutation.GetKeyID(),
@@ -81,17 +82,29 @@ func (proc *Processor) ProcessRecovery(ctx context.Context, recovery *waSyncdSna
 			PatchVersion: version,
 		}
 	}
-	err := proc.Store.AppState.DeleteAppStateVersion(ctx, name)
-	if err != nil {
-		return mutations, fmt.Errorf("failed to reset app state version in database: %w", err)
+	replace := func(ctx context.Context) error {
+		err := proc.Store.AppState.DeleteAppStateVersion(ctx, name)
+		if err != nil {
+			return fmt.Errorf("failed to reset app state version in database: %w", err)
+		}
+		err = proc.Store.AppState.PutAppStateVersion(ctx, name, version, *(*[128]byte)(recovery.GetCollectionLthash()))
+		if err != nil {
+			return fmt.Errorf("failed to update app state version in the database: %w", err)
+		}
+		err = proc.Store.AppState.PutAppStateMutationMACs(ctx, name, version, macs)
+		if err != nil {
+			return fmt.Errorf("failed to insert added mutation MACs to the database: %w", err)
+		}
+		return nil
 	}
-	err = proc.Store.AppState.PutAppStateVersion(ctx, name, version, *(*[128]byte)(recovery.GetCollectionLthash()))
-	if err != nil {
-		return mutations, fmt.Errorf("failed to update app state version in the database: %w", err)
+	// One transaction where the store supports it: the delete runs first, so an
+	// interruption before the inserts would otherwise leave the collection with no
+	// version at all.
+	var err error
+	if txn, ok := proc.Store.AppState.(store.AppStateTransactor); ok {
+		err = txn.DoAppStateTxn(ctx, replace)
+	} else {
+		err = replace(ctx)
 	}
-	err = proc.Store.AppState.PutAppStateMutationMACs(ctx, name, version, macs)
-	if err != nil {
-		return mutations, fmt.Errorf("failed to insert added mutation MACs to the database: %w", err)
-	}
-	return mutations, nil
+	return mutations, err
 }

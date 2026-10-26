@@ -879,13 +879,22 @@ const (
 		INSERT INTO whatsmeow_app_state_version (jid, name, version, hash) VALUES ($1, $2, $3, $4)
 		ON CONFLICT (jid, name) DO UPDATE SET version=excluded.version, hash=excluded.hash
 	`
-	getAppStateVersionQuery                 = `SELECT version, hash FROM whatsmeow_app_state_version WHERE jid=$1 AND name=$2`
-	deleteAppStateVersionQuery              = `DELETE FROM whatsmeow_app_state_version WHERE jid=$1 AND name=$2`
-	putAppStateMutationMACsQuery            = `INSERT INTO whatsmeow_app_state_mutation_macs (jid, name, version, index_mac, value_mac) VALUES `
-	deleteAppStateMutationMACsQueryPostgres = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=ANY($3::bytea[])`
-	deleteAppStateMutationMACsQueryGeneric  = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac IN `
-	getAppStateMutationMACQuery             = `SELECT value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=$3 ORDER BY version DESC LIMIT 1`
+	getAppStateVersionQuery                         = `SELECT version, hash FROM whatsmeow_app_state_version WHERE jid=$1 AND name=$2`
+	deleteAppStateVersionQuery                      = `DELETE FROM whatsmeow_app_state_version WHERE jid=$1 AND name=$2`
+	putAppStateMutationMACsQuery                    = `INSERT INTO whatsmeow_app_state_mutation_macs (jid, name, version, index_mac, value_mac, index_hash) VALUES `
+	deleteAppStateMutationMACsQueryPostgres         = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=ANY($3::bytea[])`
+	deleteAppStateMutationMACsQueryGeneric          = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac IN `
+	getAppStateMutationMACQuery                     = `SELECT value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=$3 ORDER BY version DESC LIMIT 1`
+	getAppStateMutationMACsByIndexHashQuery         = `SELECT index_mac, value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_hash=$3 ORDER BY version DESC`
+	getAppStateMutationMACsByIndexMACsQueryPostgres = `SELECT index_mac, value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=ANY($3::bytea[]) ORDER BY version DESC`
+	getAppStateMutationMACsByIndexMACsQueryGeneric  = `SELECT index_mac, value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac IN `
 )
+
+// DoAppStateTxn runs fn in a database transaction (or the caller's, if it already
+// has one), so app state writes made through ctx commit or roll back together.
+func (s *SQLStore) DoAppStateTxn(ctx context.Context, fn func(ctx context.Context) error) error {
+	return s.db.DoTxn(ctx, nil, fn)
+}
 
 func (s *SQLStore) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
 	_, err := s.db.Exec(ctx, putAppStateVersionQuery, s.JID, name, version, hash[:])
@@ -918,20 +927,21 @@ func (s *SQLStore) DeleteAppStateVersion(ctx context.Context, name string) error
 }
 
 func (s *SQLStore) putAppStateMutationMACs(ctx context.Context, name string, version uint64, mutations []store.AppStateMutationMAC) error {
-	values := make([]any, 3+len(mutations)*2)
+	values := make([]any, 3+len(mutations)*3)
 	queryParts := make([]string, len(mutations))
 	values[0] = s.JID
 	values[1] = name
 	values[2] = version
-	placeholderSyntax := "($1, $2, $3, $%d, $%d)"
+	placeholderSyntax := "($1, $2, $3, $%d, $%d, $%d)"
 	if s.db.Dialect == dbutil.SQLite {
-		placeholderSyntax = "(?1, ?2, ?3, ?%d, ?%d)"
+		placeholderSyntax = "(?1, ?2, ?3, ?%d, ?%d, ?%d)"
 	}
 	for i, mutation := range mutations {
-		baseIndex := 3 + i*2
+		baseIndex := 3 + i*3
 		values[baseIndex] = mutation.IndexMAC
 		values[baseIndex+1] = mutation.ValueMAC
-		queryParts[i] = fmt.Sprintf(placeholderSyntax, baseIndex+1, baseIndex+2)
+		values[baseIndex+2] = mutation.IndexHash
+		queryParts[i] = fmt.Sprintf(placeholderSyntax, baseIndex+1, baseIndex+2, baseIndex+3)
 	}
 	_, err := s.db.Exec(ctx, putAppStateMutationMACsQuery+strings.Join(queryParts, ","), values...)
 	return err
@@ -974,12 +984,81 @@ func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, 
 	return
 }
 
+// GetAppStateMutationMACsByIndexMACs returns the newest stored record of each given
+// index MAC that exists, in one query.
+func (s *SQLStore) GetAppStateMutationMACsByIndexMACs(ctx context.Context, name string, indexMACs [][]byte) ([]store.AppStateMutationMAC, error) {
+	if len(indexMACs) == 0 {
+		return nil, nil
+	}
+	var rows dbutil.Rows
+	var err error
+	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
+		rows, err = s.db.Query(ctx, getAppStateMutationMACsByIndexMACsQueryPostgres, s.JID, name, PostgresArrayWrapper(indexMACs))
+	} else {
+		args := make([]any, 2+len(indexMACs))
+		args[0] = s.JID
+		args[1] = name
+		queryParts := make([]string, len(indexMACs))
+		for i, item := range indexMACs {
+			args[2+i] = item
+			queryParts[i] = fmt.Sprintf("$%d", i+3)
+		}
+		rows, err = s.db.Query(ctx, getAppStateMutationMACsByIndexMACsQueryGeneric+"("+strings.Join(queryParts, ",")+") ORDER BY version DESC", args...)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var macs []store.AppStateMutationMAC
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		var mac store.AppStateMutationMAC
+		if err = rows.Scan(&mac.IndexMAC, &mac.ValueMAC); err != nil {
+			return nil, err
+		}
+		// Newest version first: one row per index MAC.
+		if _, dup := seen[string(mac.IndexMAC)]; dup {
+			continue
+		}
+		seen[string(mac.IndexMAC)] = struct{}{}
+		macs = append(macs, mac)
+	}
+	return macs, rows.Err()
+}
+
 func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error) {
 	err = s.db.QueryRow(ctx, getAppStateMutationMACQuery, s.JID, name, indexMAC).Scan(&valueMAC)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = nil
 	}
 	return
+}
+
+func (s *SQLStore) GetAppStateMutationMACsByIndexHash(ctx context.Context, name string, indexHash []byte) ([]store.AppStateMutationMAC, error) {
+	if len(indexHash) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(ctx, getAppStateMutationMACsByIndexHashQuery, s.JID, name, indexHash)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var macs []store.AppStateMutationMAC
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		var mac store.AppStateMutationMAC
+		if err = rows.Scan(&mac.IndexMAC, &mac.ValueMAC); err != nil {
+			return nil, err
+		}
+		// Newest version first: one row per index MAC.
+		if _, dup := seen[string(mac.IndexMAC)]; dup {
+			continue
+		}
+		seen[string(mac.IndexMAC)] = struct{}{}
+		mac.IndexHash = indexHash
+		macs = append(macs, mac)
+	}
+	return macs, rows.Err()
 }
 
 const (

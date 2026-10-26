@@ -121,6 +121,18 @@ func (cli *Client) handleAppStateRecovery(
 	}
 	name := appstate.WAPatchName(snapshot.GetCollectionName())
 	version := snapshot.GetVersion().GetVersion()
+	// Hold appStateSyncLock from the version check through the store writes, so a
+	// notification-driven fetch can't apply patches between them or interleave with
+	// the replacement.
+	cli.appStateSyncLock.Lock()
+	locked := true
+	unlock := func() {
+		if locked {
+			locked = false
+			cli.appStateSyncLock.Unlock()
+		}
+	}
+	defer unlock()
 	currentVersion, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
 	if err != nil {
 		cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
@@ -140,6 +152,7 @@ func (cli *Client) handleAppStateRecovery(
 		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
 		return true
 	}
+	unlock()
 	eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: version, Recovery: true})
 	for _, evt := range eventsToDispatch {
 		handlerFailed := cli.dispatchEvent(evt)
@@ -571,6 +584,11 @@ func (cli *Client) requestAppStateKeys(ctx context.Context, rawKeyIDs [][]byte) 
 //
 //	cli.SendAppState(ctx, appstate.BuildMute(targetJID, true, 24 * time.Hour))
 func (cli *Client) SendAppState(ctx context.Context, patch appstate.PatchInfo) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	cli.appStateSendLock.Lock()
+	defer cli.appStateSendLock.Unlock()
 	return cli.sendAppState(ctx, patch, true)
 }
 
@@ -578,21 +596,7 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 	if cli == nil {
 		return ErrClientIsNil
 	}
-	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(patch.Type))
-	if err != nil {
-		return err
-	}
-	// TODO create new key instead of reusing the primary client's keys
-	latestKeyID, err := cli.Store.AppStateKeys.GetLatestAppStateSyncKeyID(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get latest app state key ID: %w", err)
-	} else if latestKeyID == nil {
-		return fmt.Errorf("no app state keys found, creating app state keys is not yet supported")
-	}
-
-	state := appstate.HashState{Version: version, Hash: hash}
-
-	encodedPatch, err := cli.appStateProc.EncodePatch(ctx, latestKeyID, state, patch)
+	version, encodedPatch, err := cli.encodeAppStatePatch(ctx, patch)
 	if err != nil {
 		return err
 	}
@@ -634,22 +638,22 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 			mainErr = fmt.Errorf("%w (%s): %s", ErrAppStateUpdate, patch.Type, &errorTag)
 		}
 		if ok && errorTag.AttrGetter().Int("code") == 409 && allowRetry {
-			zerolog.Ctx(ctx).Warn().Err(mainErr).Msg("Failed to update app state, trying to apply conflicts and retry")
-			var eventsToDispatch []any
-			patches, err := appstate.ParsePatchList(ctx, &respCollection, cli.downloadExternalAppStateBlob)
+			zerolog.Ctx(ctx).Warn().Err(mainErr).Msg("Failed to update app state, fetching conflicting patches and retrying")
+			// Catch up through fetchAppState rather than applying the patches in this
+			// response: it holds appStateSyncLock and starts from the stored version, so
+			// it can't apply the same patches concurrently with a notification-driven
+			// fetch, which is how a conflict used to corrupt the stored hash.
+			eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
 			if err != nil {
-				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
-			} else if _, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
-				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
-			} else {
-				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
-				go func() {
-					for _, evt := range eventsToDispatch {
-						cli.dispatchEvent(evt)
-					}
-				}()
-				return cli.sendAppState(ctx, patch, false)
+				return fmt.Errorf("%w (also, fetching the conflicting patches failed: %w)", mainErr, err)
 			}
+			go func() {
+				for _, evt := range eventsToDispatch {
+					cli.dispatchEvent(evt)
+				}
+			}()
+			zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after fetching conflicting patches")
+			return cli.sendAppState(ctx, patch, false)
 		}
 		return mainErr
 	}
@@ -664,6 +668,31 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 	}()
 
 	return nil
+}
+
+// encodeAppStatePatch reads the stored state and encodes patch against it under
+// appStateSyncLock, so a concurrent fetch can't move the version or the mutation MACs
+// between the read and the encode. The lock is released before sending: if a patch
+// lands in between, the server rejects ours with a 409, which sendAppState handles.
+func (cli *Client) encodeAppStatePatch(ctx context.Context, patch appstate.PatchInfo) (uint64, []byte, error) {
+	cli.appStateSyncLock.Lock()
+	defer cli.appStateSyncLock.Unlock()
+	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(patch.Type))
+	if err != nil {
+		return 0, nil, err
+	}
+	// TODO create new key instead of reusing the primary client's keys
+	latestKeyID, err := cli.Store.AppStateKeys.GetLatestAppStateSyncKeyID(ctx)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to get latest app state key ID: %w", err)
+	} else if latestKeyID == nil {
+		return 0, nil, fmt.Errorf("no app state keys found, creating app state keys is not yet supported")
+	}
+	encodedPatch, err := cli.appStateProc.EncodePatch(ctx, latestKeyID, appstate.HashState{Version: version, Hash: hash}, patch)
+	if err != nil {
+		return 0, nil, err
+	}
+	return version, encodedPatch, nil
 }
 
 func (cli *Client) MarkNotDirty(ctx context.Context, cleanType string, ts time.Time) error {
