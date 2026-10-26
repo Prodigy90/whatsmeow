@@ -384,6 +384,15 @@ func (proc *Processor) decodeMutations(
 }
 
 func (proc *Processor) storeMACs(ctx context.Context, name WAPatchName, currentState HashState, out *patchOutput) error {
+	if txn, ok := proc.Store.AppState.(store.AppStateTransactor); ok {
+		return txn.DoAppStateTxn(ctx, func(ctx context.Context) error {
+			return proc.storeMACsNoTxn(ctx, name, currentState, out)
+		})
+	}
+	return proc.storeMACsNoTxn(ctx, name, currentState, out)
+}
+
+func (proc *Processor) storeMACsNoTxn(ctx context.Context, name WAPatchName, currentState HashState, out *patchOutput) error {
 	err := proc.Store.AppState.PutAppStateVersion(ctx, string(name), currentState.Version, currentState.Hash)
 	if err != nil {
 		return fmt.Errorf("failed to update app state version in the database: %w", err)

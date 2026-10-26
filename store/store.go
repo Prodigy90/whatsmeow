@@ -101,6 +101,15 @@ type AppStateStore interface {
 	GetAppStateMutationMACsByIndexHash(ctx context.Context, name string, indexHash []byte) ([]AppStateMutationMAC, error)
 }
 
+// AppStateTransactor is implemented by stores that can run several app state writes
+// atomically. The app state processor uses it so a patch's version, hash and mutation
+// MACs are persisted together: if they were written separately, an interruption
+// between them would leave a hash that no longer matches the stored MACs, and every
+// later patch would fail to verify.
+type AppStateTransactor interface {
+	DoAppStateTxn(ctx context.Context, fn func(ctx context.Context) error) error
+}
+
 type ContactEntry struct {
 	JID       types.JID
 	FirstName string

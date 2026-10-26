@@ -888,6 +888,12 @@ const (
 	getAppStateMutationMACsByIndexHashQuery = `SELECT index_mac, value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_hash=$3 ORDER BY version DESC`
 )
 
+// DoAppStateTxn runs fn in a database transaction (or the caller's, if it already
+// has one), so app state writes made through ctx commit or roll back together.
+func (s *SQLStore) DoAppStateTxn(ctx context.Context, fn func(ctx context.Context) error) error {
+	return s.db.DoTxn(ctx, nil, fn)
+}
+
 func (s *SQLStore) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
 	_, err := s.db.Exec(ctx, putAppStateVersionQuery, s.JID, name, version, hash[:])
 	return err
