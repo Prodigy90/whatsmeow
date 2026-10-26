@@ -110,6 +110,13 @@ type AppStateTransactor interface {
 	DoAppStateTxn(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
+// AppStateMACBatchLookup is implemented by stores that can look up the newest record
+// of many index MACs in one query. The app state processor uses it to find records of
+// one logical index written under other (rotated) keys, which have other index MACs.
+type AppStateMACBatchLookup interface {
+	GetAppStateMutationMACsByIndexMACs(ctx context.Context, name string, indexMACs [][]byte) ([]AppStateMutationMAC, error)
+}
+
 type ContactEntry struct {
 	JID       types.JID
 	FirstName string

@@ -207,6 +207,7 @@ func (plans mutationPlans) collapsesAnything() bool {
 // decodeMutations reports the missing key afterwards.
 func (proc *Processor) planMutations(ctx context.Context, name WAPatchName, mutations []*waServerSync.SyncdMutation, lookupStore bool) (mutationPlans, error) {
 	plans := make(mutationPlans, len(mutations))
+	var otherKeys *indexKeySet
 	byHash := make(map[string]store.AppStateMutationMAC)
 	byIndexMAC := make(map[string]store.AppStateMutationMAC)
 	consumed := make(map[string]struct{})
@@ -214,9 +215,11 @@ func (proc *Processor) planMutations(ctx context.Context, name WAPatchName, muta
 		record := mutation.GetRecord()
 		indexMAC := record.GetIndex().GetBlob()
 		plan := &plans[i]
+		var plainIndex []byte
 		_, _, _, syncAction, _, err := proc.decodeMutation(ctx, mutation, i, false)
 		if err == nil {
-			plan.indexHash = indexHash(syncAction.GetIndex())
+			plainIndex = syncAction.GetIndex()
+			plan.indexHash = indexHash(plainIndex)
 		} else if !errors.Is(err, ErrKeyNotFound) {
 			return nil, err
 		}
@@ -241,6 +244,25 @@ func (proc *Processor) planMutations(ctx context.Context, name WAPatchName, muta
 				stored, err := proc.Store.AppState.GetAppStateMutationMACsByIndexHash(ctx, string(name), plan.indexHash)
 				if err != nil {
 					return nil, fmt.Errorf("failed to get previous mutations of index: %w", err)
+				}
+				for _, mac := range stored {
+					if _, done := consumed[string(mac.IndexMAC)]; !done {
+						addPrevious(mac)
+					}
+				}
+			}
+			if plainIndex != nil {
+				// Rows stored before index hashes were kept can only be found by index
+				// MAC, and the index MAC depends on the key: a record of this index
+				// written under an earlier key is invisible to the lookups above.
+				if otherKeys == nil {
+					if otherKeys, err = proc.loadIndexKeys(ctx); err != nil {
+						return nil, err
+					}
+				}
+				stored, err := proc.recordsUnderOtherKeys(ctx, name, otherKeys, plainIndex, indexMAC)
+				if err != nil {
+					return nil, err
 				}
 				for _, mac := range stored {
 					if _, done := consumed[string(mac.IndexMAC)]; !done {
@@ -602,4 +624,58 @@ func (proc *Processor) DecodePatches(
 		currentState = newState
 	}
 	return
+}
+
+// indexKeySet is the index key of every stored app state key, expanded once.
+type indexKeySet struct {
+	keys [][]byte
+}
+
+func (proc *Processor) loadIndexKeys(ctx context.Context) (*indexKeySet, error) {
+	all, err := proc.Store.AppStateKeys.GetAllAppStateSyncKeys(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load app state keys: %w", err)
+	}
+	set := &indexKeySet{keys: make([][]byte, 0, len(all))}
+	for _, key := range all {
+		if key == nil || len(key.Data) == 0 {
+			continue
+		}
+		set.keys = append(set.keys, expandAppStateKeys(key.Data).Index)
+	}
+	return set, nil
+}
+
+// recordsUnderOtherKeys returns the stored records of plainIndex written under any
+// app state key other than the one that produced currentIndexMAC. The primary
+// subtracts every record of a logical index on SET, whichever key wrote it.
+func (proc *Processor) recordsUnderOtherKeys(ctx context.Context, name WAPatchName, keys *indexKeySet, plainIndex, currentIndexMAC []byte) ([]store.AppStateMutationMAC, error) {
+	candidates := make([][]byte, 0, len(keys.keys))
+	for _, indexKey := range keys.keys {
+		mac := concatAndHMAC(sha256.New, indexKey, plainIndex)
+		if !hmac.Equal(mac, currentIndexMAC) {
+			candidates = append(candidates, mac)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	if batch, ok := proc.Store.AppState.(store.AppStateMACBatchLookup); ok {
+		stored, err := batch.GetAppStateMutationMACsByIndexMACs(ctx, string(name), candidates)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get records of index under other keys: %w", err)
+		}
+		return stored, nil
+	}
+	var stored []store.AppStateMutationMAC
+	for _, mac := range candidates {
+		valueMAC, err := proc.Store.AppState.GetAppStateMutationMAC(ctx, string(name), mac)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get record of index under another key: %w", err)
+		}
+		if valueMAC != nil {
+			stored = append(stored, store.AppStateMutationMAC{IndexMAC: mac, ValueMAC: valueMAC})
+		}
+	}
+	return stored, nil
 }

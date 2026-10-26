@@ -58,7 +58,11 @@ func (m *memAppState) GetLatestAppStateSyncKeyID(ctx context.Context) ([]byte, e
 	return nil, nil
 }
 func (m *memAppState) GetAllAppStateSyncKeys(ctx context.Context) ([]*store.AppStateSyncKey, error) {
-	return nil, nil
+	keys := make([]*store.AppStateSyncKey, 0, len(m.keys))
+	for _, key := range m.keys {
+		keys = append(keys, key)
+	}
+	return keys, nil
 }
 
 func (m *memAppState) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
