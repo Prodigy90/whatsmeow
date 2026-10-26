@@ -942,7 +942,12 @@ func (cli *Client) handleProtocolMessage(ctx context.Context, info *types.Messag
 		case waE2E.PeerDataOperationRequestType_PLACEHOLDER_MESSAGE_RESEND:
 			ok = cli.handlePlaceholderResendResponse(peerResp) && ok
 		case waE2E.PeerDataOperationRequestType_COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY:
-			ok = cli.handleAppStateRecovery(ctx, peerResp.GetStanzaID(), peerResp.GetPeerDataOperationResult()) && ok
+			// Applying a recovery snapshot waits for appStateSyncLock, which a fetch can
+			// hold for a network round trip. Run it off the message queue so that wait
+			// can't stall every other inbound message. Its result only reports a failed
+			// success-status event handler, and the version check under the lock makes a
+			// redelivered response a no-op, so nothing depends on it here.
+			go cli.handleAppStateRecovery(context.WithoutCancel(ctx), peerResp.GetStanzaID(), peerResp.GetPeerDataOperationResult())
 		}
 	}
 
