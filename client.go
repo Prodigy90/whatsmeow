@@ -103,6 +103,9 @@ type Client struct {
 
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
+	// appStateSendLock serialises SendAppState. Concurrent sends to one collection
+	// encode against the same base version and race each other's conflict handling.
+	appStateSendLock sync.Mutex
 
 	historySyncNotifications        chan *waE2E.HistorySyncNotification
 	historySyncHandlerStarted       atomic.Bool

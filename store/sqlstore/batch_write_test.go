@@ -25,11 +25,11 @@ import (
 // args, and transaction begins, so tests can assert on statement shape (UNNEST vs
 // placeholders), statement count, and the absence of explicit transactions.
 type recordingDB struct {
-	execs  []recordedStatement
-	begins int
-	beginAt []int // len(execs) at each Begin, so tests can see what ran inside a txn
-	rows   [][]driver.Value // rows returned by the next QueryContext
-	cols   []string
+	execs   []recordedStatement
+	begins  int
+	beginAt []int            // len(execs) at each Begin, so tests can see what ran inside a txn
+	rows    [][]driver.Value // rows returned by the next QueryContext
+	cols    []string
 }
 
 type recordedStatement struct {
