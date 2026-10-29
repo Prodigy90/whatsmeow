@@ -69,6 +69,12 @@ func (cli *Client) fetchPreKeysForSend(ctx context.Context, devices []types.JID,
 		// One refused device can fail the whole IQ, so a multi-device batch is re-probed
 		// one device at a time to name the culprit (capped at prewarmMaxIsolate).
 		reason := prekeyRejectionReason(err)
+		if len(devices) > prewarmMaxIsolate {
+			// Too many to probe one by one on this ban-sensitive path. Report it, or
+			// the send stays slow with nothing in the logs (the client logger is SILENT).
+			report.Err = fmt.Errorf("prekeys refused (%s) for a request of %d devices, more than the %d that are isolated; none dropped", reason, len(devices), prewarmMaxIsolate)
+			return nil
+		}
 		for _, dead := range cli.isolateRejectedDevices(ctx, devices, err, &PrewarmResult{}) {
 			report.reject(dead, reason)
 		}

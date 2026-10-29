@@ -191,3 +191,27 @@ func TestFetchPreKeysForSend_PoisonedBatchSparesLiveDevice(t *testing.T) {
 		t.Fatalf("rejected = %v, want only the dead device", report.Rejected)
 	}
 }
+
+// Past the isolation cap nothing can be named, but the refusal must still be
+// reported so the caller's log shows why the send was slow.
+func TestFetchPreKeysForSend_OverIsolationCapIsReported(t *testing.T) {
+	var devs []types.JID
+	for i := 0; i <= prewarmMaxIsolate; i++ {
+		devs = append(devs, pnDevice("2348031568621", uint16(i+1)))
+	}
+	hook, calls := prekeyServer(devs...)
+	cli := &Client{Log: waLog.Noop, fetchPreKeysHook: hook}
+
+	var report PreKeyFetchReport
+	cli.fetchPreKeysForSend(context.Background(), devs, &report)
+
+	if len(report.Rejected) != 0 {
+		t.Fatalf("rejected %d devices past the isolation cap", len(report.Rejected))
+	}
+	if report.Err == nil {
+		t.Fatal("refusal past the isolation cap was not reported")
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("made %d prekey requests, want 1 (no solo probes past the cap)", len(*calls))
+	}
+}
