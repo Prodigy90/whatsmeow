@@ -384,3 +384,47 @@ func TestPutMessageSecretsChunkedPathDropsIncompleteEntries(t *testing.T) {
 		t.Errorf("second chunk: expected %d args (1 valid row), got %d", want, got)
 	}
 }
+
+// A flush bigger than one chunk is split into postgresSessionChunkSize statements,
+// committed together, with the sorted address order kept across chunks.
+func TestPutManySessionsPostgresChunksLargeFlushInOneTxn(t *testing.T) {
+	state := &recordingDB{}
+	prev := PostgresArrayWrapper
+	var wrapped []any
+	PostgresArrayWrapper = func(val any) interface {
+		driver.Valuer
+		sql.Scanner
+	} {
+		wrapped = append(wrapped, val)
+		return testArrayValuer{wrapped: len(wrapped)}
+	}
+	t.Cleanup(func() { PostgresArrayWrapper = prev })
+	s := newRecordingStore(t, "postgres", state)
+
+	const n = 2*postgresSessionChunkSize + 500
+	sessions := make(map[string][]byte, n)
+	for i := 0; i < n; i++ {
+		sessions[fmt.Sprintf("%07d:1", i)] = []byte{byte(i)}
+	}
+	if err := s.PutManySessions(context.Background(), sessions); err != nil {
+		t.Fatalf("PutManySessions: %v", err)
+	}
+	if state.begins != 1 {
+		t.Fatalf("expected the chunks in 1 transaction, got %d begins", state.begins)
+	}
+	if len(state.execs) != 3 {
+		t.Fatalf("expected 3 statements, got %d", len(state.execs))
+	}
+	var prevLast string
+	for i := 0; i < 3; i++ {
+		addrs := wrapped[2*i].([]string)
+		blobs := wrapped[2*i+1].([][]byte)
+		if len(addrs) > postgresSessionChunkSize || len(addrs) != len(blobs) {
+			t.Fatalf("chunk %d: %d addresses, %d blobs", i, len(addrs), len(blobs))
+		}
+		if addrs[0] <= prevLast {
+			t.Fatalf("chunk %d starts at %s, not after %s", i, addrs[0], prevLast)
+		}
+		prevLast = addrs[len(addrs)-1]
+	}
+}
