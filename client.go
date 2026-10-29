@@ -182,7 +182,15 @@ type Client struct {
 	// The callback runs in a new goroutine. Panics are recovered and logged with a stack trace
 	// so application code panics don't crash the worker. Use SetMaxParallelNoDeviceContactsCallbacks
 	// to bound concurrent invocations under heavy GetUserDevices load.
-	OnNoDeviceContacts   func(jids []types.JID)
+	OnNoDeviceContacts func(jids []types.JID)
+	// OnPreKeyRejectedContacts is called during a send with contacts whose every
+	// cached device was refused prekeys by the server (and so dropped from the
+	// device-list cache). Nothing can be encrypted to them until their device list
+	// changes. Called synchronously; keep it cheap.
+	OnPreKeyRejectedContacts func(jids []types.JID)
+
+	// fetchPreKeysHook replaces the prekey IQ in tests.
+	fetchPreKeysHook     func(ctx context.Context, users []types.JID) (map[types.JID]preKeyResp, error)
 	noDeviceContactsSema *semaphore.Weighted
 
 	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and

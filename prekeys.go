@@ -122,6 +122,9 @@ type preKeyResp struct {
 }
 
 func (cli *Client) fetchPreKeys(ctx context.Context, users []types.JID) (map[types.JID]preKeyResp, error) {
+	if cli.fetchPreKeysHook != nil {
+		return cli.fetchPreKeysHook(ctx, users)
+	}
 	requests := make([]waBinary.Node, len(users))
 	for i, user := range users {
 		requests[i].Tag = "user"
