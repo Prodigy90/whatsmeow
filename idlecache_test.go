@@ -36,8 +36,11 @@ func (m *memDeviceLists) GetManyDeviceLists(_ context.Context, _ types.JID, thei
 	return out, nil
 }
 
-func (m *memDeviceLists) DeleteDeviceList(context.Context, types.JID, types.JID) error { return nil }
-func (m *memDeviceLists) DeleteAllDeviceLists(context.Context, types.JID) error        { return nil }
+func (m *memDeviceLists) DeleteDeviceList(_ context.Context, _, theirJID types.JID) error {
+	delete(m.rows, theirJID.ToNonAD())
+	return nil
+}
+func (m *memDeviceLists) DeleteAllDeviceLists(context.Context, types.JID) error { return nil }
 
 type countingReleaser struct{ n, calls int }
 

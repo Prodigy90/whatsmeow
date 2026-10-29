@@ -73,7 +73,7 @@ func testReportsSessionFlush(t *testing.T, storeErr error) {
 	}
 
 	var flush time.Duration
-	nodes, _, err := cli.encryptMessageForDevicesTimed(ctx, []types.JID{lidDev}, "MSGID", []byte("hello"), nil, waBinary.Attrs{}, &flush)
+	nodes, _, err := cli.encryptMessageForDevicesTimed(ctx, []types.JID{lidDev}, "MSGID", []byte("hello"), nil, waBinary.Attrs{}, &flush, nil)
 	if storeErr != nil {
 		if !errors.Is(err, storeErr) {
 			t.Fatalf("got err %v, want the store's %v", err, storeErr)

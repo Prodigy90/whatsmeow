@@ -90,6 +90,9 @@ type MessageDebugTimings struct {
 	// SessionFlush is the part of PeerEncrypt spent saving the advanced Signal
 	// sessions and identities to the store before the message is sent.
 	SessionFlush time.Duration
+	// PreKey is set when the send fetched prekeys for devices it had no session
+	// with: how long that took and which devices the server refused.
+	PreKey *PreKeyFetchReport
 
 	Send  time.Duration
 	Resp  time.Duration
@@ -112,6 +115,13 @@ func (mdt MessageDebugTimings) MarshalZerologObject(evt *zerolog.Event) {
 	evt.Dur("peer_encrypt", mdt.PeerEncrypt)
 	if mdt.SessionFlush != 0 {
 		evt.Dur("session_flush", mdt.SessionFlush)
+	}
+	if mdt.PreKey != nil {
+		evt.Int("prekey_requested", mdt.PreKey.Requested)
+		evt.Dur("prekey_fetch", mdt.PreKey.Duration)
+		if len(mdt.PreKey.Rejected) > 0 {
+			evt.Int("prekey_rejected", len(mdt.PreKey.Rejected))
+		}
 	}
 	evt.Dur("send", mdt.Send)
 	evt.Dur("resp", mdt.Resp)
@@ -1369,10 +1379,14 @@ func (cli *Client) prepareMessageNode(
 	}
 
 	start = time.Now()
+	var preKeyReport PreKeyFetchReport
 	participantNodes, includeIdentity, err := cli.encryptMessageForDevicesTimed(
-		ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs, &timings.SessionFlush,
+		ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs, &timings.SessionFlush, &preKeyReport,
 	)
 	timings.PeerEncrypt = time.Since(start)
+	if preKeyReport.Requested > 0 {
+		timings.PreKey = &preKeyReport
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1500,11 +1514,13 @@ func (cli *Client) encryptMessageForDevices(
 	msgPlaintext, dsmPlaintext []byte,
 	encAttrs waBinary.Attrs,
 ) ([]waBinary.Node, bool, error) {
-	return cli.encryptMessageForDevicesTimed(ctx, allDevices, id, msgPlaintext, dsmPlaintext, encAttrs, nil)
+	return cli.encryptMessageForDevicesTimed(ctx, allDevices, id, msgPlaintext, dsmPlaintext, encAttrs, nil, nil)
 }
 
 // encryptMessageForDevicesTimed is encryptMessageForDevices that also reports,
-// through flushDurOut when non-nil, how long the session/identity flush took.
+// through flushDurOut when non-nil, how long the session/identity flush took, and
+// through preKeyOut when non-nil, what the prekey fetch for session-less devices got
+// back. Devices the server refuses are dropped from the device-list cache either way.
 func (cli *Client) encryptMessageForDevicesTimed(
 	ctx context.Context,
 	allDevices []types.JID,
@@ -1512,6 +1528,7 @@ func (cli *Client) encryptMessageForDevicesTimed(
 	msgPlaintext, dsmPlaintext []byte,
 	encAttrs waBinary.Attrs,
 	flushDurOut *time.Duration,
+	preKeyOut *PreKeyFetchReport,
 ) ([]waBinary.Node, bool, error) {
 	ownJID := cli.getOwnID()
 	ownLID := cli.getOwnLID()
@@ -1565,7 +1582,13 @@ func (cli *Client) encryptMessageForDevicesTimed(
 		// would overwrite a concurrent ratchet advance.
 		unlockSessions()
 		unlockSessions = func() {}
-		bundles = cli.fetchPreKeysNoError(ctx, retryDevices)
+		var report PreKeyFetchReport
+		bundles = cli.fetchPreKeysForSend(ctx, retryDevices, &report)
+		report.Emptied = cli.dropRejectedDevices(ctx, report.Rejected)
+		cli.notifyPreKeyRejectedContacts(report.Emptied)
+		if preKeyOut != nil {
+			*preKeyOut = report
+		}
 		unlockSessions = cli.Store.LockSessions(sessionAddresses)
 		existingSessions, ctx, err = cli.Store.WithCachedSessions(baseCtx, sessionAddresses)
 		if err != nil {
