@@ -44,12 +44,12 @@ var PostgresArrayWrapper func(any) interface {
 }
 
 // PostgresBulkExecMode, when set and the driver is pgx stdlib, is passed as the first
-// argument of the bulk session upsert so it bypasses the connection's default exec
-// mode. Set it to pgx.QueryExecModeDescribeExec: the address and session arrays then
-// go as binary parameters instead of hex text inlined into the SQL. For a 7,500-session
-// flush that measured 0.45s vs 1.1s and a 26MB vs 210MB peak heap (2026-10-29).
-// The write always runs in a transaction, which keeps the describe and the execute on
-// one server connection behind a transaction-mode PgBouncer.
+// argument of the bulk session read and upsert so they bypass the connection's default
+// exec mode. Set it to pgx.QueryExecModeDescribeExec: parameters and session blobs then
+// travel binary instead of as hex text. Measured 2026-10-29 for 7,500 sessions: the
+// flush 0.39s vs 1.1s with a 30MB vs 210MB heap peak, the read 0.1-0.24s vs 0.44s.
+// Both always run in a transaction, which keeps the describe and the execute on one
+// server connection behind a transaction-mode PgBouncer.
 var PostgresBulkExecMode any
 
 // postgresSessionChunkSize bounds the sessions in one upsert statement, so a large
@@ -425,7 +425,7 @@ func (s *SQLStore) PutManySessions(ctx context.Context, sessions map[string][]by
 	if len(addresses) == 1 {
 		return s.PutSession(ctx, addresses[0], sessions[addresses[0]])
 	}
-	binary := s.db.Dialect == dbutil.Postgres && PostgresBulkExecMode != nil && isNativePostgresArrayDriver(s.db)
+	binary := s.bulkBinary()
 	if binary || supportsPostgresArrays(s.db) {
 		blobs := make([][]byte, len(addresses))
 		for i, addr := range addresses {
@@ -516,10 +516,22 @@ func (s *SQLStore) IterateSessions(ctx context.Context, addresses []string, call
 	if len(addresses) == 0 {
 		return nil
 	}
-	rows, err := s.queryByAddresses(ctx, getManySessionQueryPostgres, getManySessionQueryGeneric, addresses)
-	return rawSessionScanner.NewRowIter(rows, err).Iter(func(tuple rawAddressSessionTuple) (bool, error) {
-		return true, callback(tuple.Address, tuple.Session)
-	})
+	iterate := func(rows dbutil.Rows, err error) error {
+		return rawSessionScanner.NewRowIter(rows, err).Iter(func(tuple rawAddressSessionTuple) (bool, error) {
+			return true, callback(tuple.Address, tuple.Session)
+		})
+	}
+	if s.bulkBinary() {
+		return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+			return iterate(s.db.Query(ctx, getManySessionQueryPostgres, PostgresBulkExecMode, s.JID, addresses))
+		})
+	}
+	return iterate(s.queryByAddresses(ctx, getManySessionQueryPostgres, getManySessionQueryGeneric, addresses))
+}
+
+// bulkBinary reports whether bulk session reads and writes go with PostgresBulkExecMode.
+func (s *SQLStore) bulkBinary() bool {
+	return s.db.Dialect == dbutil.Postgres && PostgresBulkExecMode != nil && isNativePostgresArrayDriver(s.db)
 }
 
 func (s *SQLStore) PutSession(ctx context.Context, address string, session []byte) error {
