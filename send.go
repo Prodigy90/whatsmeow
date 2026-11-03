@@ -207,7 +207,34 @@ type SendRequestExtra struct {
 	// without having to remove the underlying contact from the audience.
 	ExcludeDevices []types.JID
 
+	// StatusLIDAddressing sends a status@broadcast message addressed entirely in LID space, the
+	// way WhatsApp Web does: every Participants entry must be an @lid user (the caller converts
+	// phone numbers, including its own, before sending), and the message is sent as our own LID.
+	// A participant in any other form makes SendMessage fail before anything goes on the wire,
+	// because a stanza mixing LID and phone addressing is rejected as a whole (<ack error="400">).
+	// Ignored for every other destination.
+	StatusLIDAddressing bool
+
 	CheckPermissions bool
+}
+
+// ErrStatusMixedAddressing is returned when a LID-addressed status send is given a participant
+// that is not an @lid user.
+var ErrStatusMixedAddressing = errors.New("LID-addressed status send has a participant that is not an @lid user")
+
+// checkStatusLIDParticipants reports the first participant of a LID-addressed status send that
+// is not a plain @lid user JID. Device suffixes are refused too: the participant list names
+// people, GetUserDevices expands them to devices.
+func checkStatusLIDParticipants(participants []types.JID) error {
+	if len(participants) == 0 {
+		return fmt.Errorf("%w: no participants", ErrStatusMixedAddressing)
+	}
+	for _, jid := range participants {
+		if jid.Server != types.HiddenUserServer || jid.User == "" || jid.Device != 0 {
+			return fmt.Errorf("%w: %s", ErrStatusMixedAddressing, jid)
+		}
+	}
+	return nil
 }
 
 // SendMessage sends the given message.
@@ -375,6 +402,18 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 				groupParticipants, err = cli.getBroadcastListParticipants(ctx, to)
 				if err != nil {
 					err = fmt.Errorf("failed to get broadcast list members: %w", err)
+					return
+				}
+			}
+			if req.StatusLIDAddressing && to == types.StatusBroadcastJID {
+				if err = checkStatusLIDParticipants(groupParticipants); err != nil {
+					return
+				}
+				// Same as a LID-addressed group above: the message goes out as our LID, which
+				// is the identity the reporting token and the stored message secret are keyed on.
+				ownID = cli.getOwnLID()
+				if ownID.IsEmpty() {
+					err = fmt.Errorf("LID-addressed status send without an own LID: %w", ErrNotLoggedIn)
 					return
 				}
 			}
