@@ -21,7 +21,7 @@ func TestCheckStatusLIDParticipants(t *testing.T) {
 	bad := map[string][]types.JID{
 		"own phone JID among LIDs": {lid("111"), lid("222"), pn("2349018943768")},
 		"phone JID first":          {pn("2348000000000"), lid("111")},
-		"device-suffixed LID":      {lid("111"), types.NewADJID("222", 0, 14).ToNonAD(), {User: "333", Server: types.HiddenUserServer, Device: 14}},
+		"device-suffixed LID":      {lid("111"), {User: "333", Server: types.HiddenUserServer, Device: 14}},
 		"group JID":                {lid("111"), types.NewJID("120363000000000000", types.GroupServer)},
 		"empty user":               {{Server: types.HiddenUserServer}},
 		"no participants":          nil,
