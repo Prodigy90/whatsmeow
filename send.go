@@ -962,8 +962,12 @@ func (cli *Client) sendGroup(
 		skMsg.Attrs["mediatype"] = mediaType
 	}
 	node.Content = append(node.GetChildren(), skMsg)
-	if cli.shouldIncludeReportingToken(message) && message.GetMessageContextInfo().GetMessageSecret() != nil {
+	webRevoke := extraParams.statusWebShape && node.Attrs["edit"] != nil
+	if !webRevoke && cli.shouldIncludeReportingToken(message) && message.GetMessageContextInfo().GetMessageSecret() != nil {
 		node.Content = append(node.GetChildren(), cli.getMessageReportingToken(plaintext, message, ownID, to, id))
+	}
+	if extraParams.statusWebShape && !webRevoke {
+		node.Content = orderStatusChildren(node.GetChildren())
 	}
 
 	start = time.Now()
@@ -1368,6 +1372,10 @@ func (cli *Client) prepareMessageNode(
 	timings *MessageDebugTimings,
 	extraParams nodeExtraParams,
 ) (*waBinary.Node, []types.JID, error) {
+	if extraParams.statusWebShape && getEditAttribute(message) == types.EditAttributeSenderRevoke {
+		return cli.prepareStatusWebRevokeNode(to, id, message, participants)
+	}
+
 	start := time.Now()
 	allDevices, err := cli.GetUserDevices(ctx, participants)
 	timings.GetDevices = time.Since(start)
@@ -1439,6 +1447,9 @@ func (cli *Client) prepareMessageNode(
 	if err != nil {
 		return nil, nil, err
 	}
+	if extraParams.statusWebShape {
+		participantNodes = bareEntryLastPerUser(participantNodes)
+	}
 	participantNode := waBinary.Node{
 		Tag:     "participants",
 		Content: participantNodes,
@@ -1456,6 +1467,91 @@ func (cli *Client) prepareMessageNode(
 			extraParams,
 		),
 	}, allDevices, nil
+}
+
+// prepareStatusWebRevokeNode builds a status delete the way WhatsApp Web does
+// (WAWebEncryptAndSendStatusMsg + WASmaxOutStatusPublishStatusRevokeMixin, capture
+// 2026-11-06 line 1371): <status edit="7"> listing each recipient once as a bare user LID,
+// with only the sender-key <enc type="skmsg"> appended by the caller. Every recipient already
+// holds our status sender key from the original post, so nothing is re-encrypted per device,
+// no device list is fetched, and there is no <meta>, <device-identity> or reporting token.
+func (cli *Client) prepareStatusWebRevokeNode(
+	to types.JID, id types.MessageID, message *waE2E.Message, participants []types.JID,
+) (*waBinary.Node, []types.JID, error) {
+	seen := make(map[string]struct{}, len(participants))
+	nodes := make([]waBinary.Node, 0, len(participants))
+	users := make([]types.JID, 0, len(participants))
+	for _, p := range participants {
+		user := p.ToNonAD()
+		if _, dup := seen[user.User]; dup {
+			continue
+		}
+		seen[user.User] = struct{}{}
+		users = append(users, user)
+		nodes = append(nodes, waBinary.Node{Tag: "to", Attrs: waBinary.Attrs{"jid": user}})
+	}
+	return &waBinary.Node{
+		Tag: "status",
+		Attrs: waBinary.Attrs{
+			"id":   id,
+			"to":   to,
+			"edit": string(types.EditAttributeSenderRevoke),
+			"type": getTypeFromMessage(message),
+		},
+		Content: []waBinary.Node{{Tag: "participants", Content: nodes}},
+	}, users, nil
+}
+
+// statusChildRank is WhatsApp Web's child order on a status post (capture 2026-11-06 lines
+// 1156/1236/1278): reporting, participants, enc skmsg, meta, device-identity.
+var statusChildRank = map[string]int{"reporting": 0, "participants": 1, "enc": 2, "meta": 3, "device-identity": 4}
+
+func orderStatusChildren(children []waBinary.Node) []waBinary.Node {
+	out := slices.Clone(children)
+	slices.SortStableFunc(out, func(a, b waBinary.Node) int {
+		ra, oka := statusChildRank[a.Tag]
+		rb, okb := statusChildRank[b.Tag]
+		if !oka {
+			ra = len(statusChildRank)
+		}
+		if !okb {
+			rb = len(statusChildRank)
+		}
+		return ra - rb
+	})
+	return out
+}
+
+// bareEntryLastPerUser moves each user's device-0 (bare) <to> after that user's device-suffixed
+// entries, keeping users in their original order. WhatsApp Web lists "u:1, u:2, u" where the
+// device list we get back gives "u, u:1, u:2".
+func bareEntryLastPerUser(nodes []waBinary.Node) []waBinary.Node {
+	userOf := func(n waBinary.Node) (string, uint16) {
+		jid, _ := n.Attrs["jid"].(types.JID)
+		return jid.User, jid.Device
+	}
+	out := make([]waBinary.Node, 0, len(nodes))
+	for i := 0; i < len(nodes); {
+		user, _ := userOf(nodes[i])
+		j := i
+		for j < len(nodes) {
+			if u, _ := userOf(nodes[j]); u != user {
+				break
+			}
+			j++
+		}
+		var bare []waBinary.Node
+		for _, n := range nodes[i:j] {
+			if _, dev := userOf(n); dev == 0 {
+				bare = append(bare, n)
+			} else {
+				out = append(out, n)
+			}
+		}
+		out = append(out, bare...)
+		i = j
+	}
+	return out
 }
 
 // withoutSendingDevice drops this client's own device, in both its phone and LID form, from a

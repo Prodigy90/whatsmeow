@@ -98,8 +98,12 @@ type Client struct {
 	AppStateDebugLogs            bool
 
 	AutomaticMessageRerequestFromPhone bool
-	pendingPhoneRerequests             map[types.MessageID]context.CancelFunc
-	pendingPhoneRerequestsLock         sync.RWMutex
+
+	// StatusWebShapeRetries re-sends a status@broadcast message after a retry receipt with the
+	// root tag <status>, the way WhatsApp Web does. Set it together with StatusLIDAddressing.
+	StatusWebShapeRetries      bool
+	pendingPhoneRerequests     map[types.MessageID]context.CancelFunc
+	pendingPhoneRerequestsLock sync.RWMutex
 
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex

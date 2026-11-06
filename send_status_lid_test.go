@@ -2,8 +2,12 @@ package whatsmeow
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
@@ -64,5 +68,76 @@ func TestWithoutSendingDevice(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got %v, want %v", got, want)
 		}
+	}
+}
+
+func tags(nodes []waBinary.Node) []string {
+	out := make([]string, len(nodes))
+	for i, n := range nodes {
+		out[i] = n.Tag
+	}
+	return out
+}
+
+// WhatsApp Web's child order on a status post (capture 2026-11-06 lines 1156/1236/1278).
+func TestOrderStatusChildren(t *testing.T) {
+	in := []waBinary.Node{{Tag: "participants"}, {Tag: "device-identity"}, {Tag: "meta"}, {Tag: "enc"}, {Tag: "reporting"}}
+	got := tags(orderStatusChildren(in))
+	want := []string{"reporting", "participants", "enc", "meta", "device-identity"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+// WhatsApp Web lists a user's device-suffixed <to> entries before the bare one.
+func TestBareEntryLastPerUser(t *testing.T) {
+	to := func(u string, d uint16) waBinary.Node {
+		return waBinary.Node{Tag: "to", Attrs: waBinary.Attrs{"jid": types.JID{User: u, Server: types.HiddenUserServer, Device: d}}}
+	}
+	in := []waBinary.Node{to("a", 0), to("a", 1), to("a", 9), to("b", 0), to("c", 0), to("c", 41), to("c", 43)}
+	var got []string
+	for _, n := range bareEntryLastPerUser(in) {
+		got = append(got, n.Attrs["jid"].(types.JID).String())
+	}
+	want := []string{"a:1@lid", "a:9@lid", "a@lid", "b@lid", "c:41@lid", "c:43@lid", "c@lid"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+// WhatsApp Web's status delete (capture 2026-11-06 line 1371): <status edit="7">, each
+// recipient once as a bare user LID, no per-device encryption, no <meta>, no device-identity.
+func TestPrepareStatusWebRevokeNode(t *testing.T) {
+	cli := &Client{}
+	lid := func(u string, d uint16) types.JID {
+		return types.JID{User: u, Server: types.HiddenUserServer, Device: d}
+	}
+	revoke := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_REVOKE.Enum(),
+		Key:  &waCommon.MessageKey{RemoteJID: new("status@broadcast"), FromMe: new(true), ID: new("3EB0BC46DDC3478A1716C7")},
+	}}
+	node, users, err := cli.prepareStatusWebRevokeNode(types.StatusBroadcastJID, "3EB0148B4E661E8A004BC8", revoke,
+		[]types.JID{lid("81557301796887", 0), lid("31482697482258", 0), lid("31482697482258", 9), lid("81557301796887", 0), lid("58587783151865", 41)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Tag != "status" || node.Attrs["edit"] != "7" || node.Attrs["type"] != "text" {
+		t.Fatalf("root = <%s %v>", node.Tag, node.Attrs)
+	}
+	if got := tags(node.GetChildren()); !slices.Equal(got, []string{"participants"}) {
+		t.Fatalf("children = %v, want only participants (the caller appends the skmsg)", got)
+	}
+	var jids []string
+	for _, to := range node.GetChildren()[0].GetChildren() {
+		if len(to.GetChildren()) != 0 || to.Content != nil {
+			t.Fatalf("revoke <to> carries content (per-device enc): %v", to)
+		}
+		jids = append(jids, to.Attrs["jid"].(types.JID).String())
+	}
+	if want := []string{"81557301796887@lid", "31482697482258@lid", "58587783151865@lid"}; !slices.Equal(jids, want) {
+		t.Fatalf("revoke recipients = %v, want %v", jids, want)
+	}
+	if len(users) != 3 {
+		t.Fatalf("users = %v", users)
 	}
 }
