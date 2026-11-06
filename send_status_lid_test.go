@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"go.mau.fi/libsignal/protocol"
+
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
