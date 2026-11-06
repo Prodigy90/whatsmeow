@@ -897,6 +897,9 @@ type nodeExtraParams struct {
 	// sending device is left out of <participants> (our other devices stay, so the status still
 	// shows on the user's own phone). Only set with StatusLIDAddressing.
 	statusWebShape bool
+	// statusBareRevoke sends a statusWebShape delete in WA Web's bare form (sendGroup sets it
+	// only when our status sender key is stored, so every recipient can decrypt the skmsg).
+	statusBareRevoke bool
 }
 
 func (cli *Client) sendGroup(
@@ -919,6 +922,16 @@ func (cli *Client) sendGroup(
 	start = time.Now()
 	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
 	senderKeyName := protocol.NewSenderKeyName(to.String(), cli.getOwnLID().SignalAddress())
+	if extraParams.statusWebShape && getEditAttribute(message) == types.EditAttributeSenderRevoke {
+		// The bare WA Web delete works only because every recipient already holds the sender key
+		// the original post was distributed under. With no stored key, builder.Create below makes
+		// a fresh one nobody has: the delete would be accepted and undecryptable, and the status
+		// would stay up. Fall back to the per-device delete then, as WA Web does after a reset.
+		extraParams.statusBareRevoke = cli.hasStoredSenderKey(ctx, senderKeyName)
+		if !extraParams.statusBareRevoke {
+			cli.Log.Warnf("No stored status sender key for %s, sending delete %s per device", senderKeyName.Sender(), id)
+		}
+	}
 	signalSKDMessage, err := builder.Create(ctx, senderKeyName)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create sender key distribution message to send %s to %s: %w", id, to, err)
@@ -1372,7 +1385,7 @@ func (cli *Client) prepareMessageNode(
 	timings *MessageDebugTimings,
 	extraParams nodeExtraParams,
 ) (*waBinary.Node, []types.JID, error) {
-	if extraParams.statusWebShape && getEditAttribute(message) == types.EditAttributeSenderRevoke {
+	if extraParams.statusBareRevoke {
 		return cli.prepareStatusWebRevokeNode(to, id, message, participants)
 	}
 
@@ -1552,6 +1565,13 @@ func bareEntryLastPerUser(nodes []waBinary.Node) []waBinary.Node {
 		i = j
 	}
 	return out
+}
+
+// hasStoredSenderKey reports whether our sender key for this group/broadcast is already stored,
+// i.e. whether recipients of an earlier send can decrypt a skmsg under it.
+func (cli *Client) hasStoredSenderKey(ctx context.Context, name *protocol.SenderKeyName) bool {
+	existing, err := cli.Store.SenderKeys.GetSenderKey(ctx, name.GroupID(), name.Sender().String())
+	return err == nil && len(existing) > 0
 }
 
 // withoutSendingDevice drops this client's own device, in both its phone and LID form, from a

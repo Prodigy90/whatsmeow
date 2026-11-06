@@ -1,10 +1,12 @@
 package whatsmeow
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"testing"
 
+	"go.mau.fi/libsignal/protocol"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -139,5 +141,38 @@ func TestPrepareStatusWebRevokeNode(t *testing.T) {
 	}
 	if len(users) != 3 {
 		t.Fatalf("users = %v", users)
+	}
+}
+
+type fakeSenderKeys struct {
+	keys map[string][]byte
+	err  error
+}
+
+func (f fakeSenderKeys) PutSenderKey(_ context.Context, group, user string, session []byte) error {
+	f.keys[group+"|"+user] = session
+	return nil
+}
+func (f fakeSenderKeys) GetSenderKey(_ context.Context, group, user string) ([]byte, error) {
+	return f.keys[group+"|"+user], f.err
+}
+
+// The bare delete is only decryptable under the sender key the original post used. No stored
+// key (wiped store, reset) or an unreadable one must fall back to the per-device delete.
+func TestHasStoredSenderKey(t *testing.T) {
+	own := types.JID{User: "31482697482258", Server: types.HiddenUserServer, Device: 13}
+	name := protocol.NewSenderKeyName(types.StatusBroadcastJID.String(), own.SignalAddress())
+	keys := fakeSenderKeys{keys: map[string][]byte{}}
+	cli := &Client{Store: &store.Device{SenderKeys: keys}}
+	if cli.hasStoredSenderKey(context.Background(), name) {
+		t.Fatal("no stored key, but the bare delete was allowed")
+	}
+	keys.keys[name.GroupID()+"|"+name.Sender().String()] = []byte{1}
+	if !cli.hasStoredSenderKey(context.Background(), name) {
+		t.Fatal("stored key not found")
+	}
+	cli.Store.SenderKeys = fakeSenderKeys{keys: keys.keys, err: errors.New("db down")}
+	if cli.hasStoredSenderKey(context.Background(), name) {
+		t.Fatal("unreadable key store, but the bare delete was allowed")
 	}
 }
