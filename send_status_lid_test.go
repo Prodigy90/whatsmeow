@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -30,6 +31,38 @@ func TestCheckStatusLIDParticipants(t *testing.T) {
 		err := checkStatusLIDParticipants(list)
 		if !errors.Is(err, ErrStatusMixedAddressing) {
 			t.Errorf("%s: got %v, want ErrStatusMixedAddressing", name, err)
+		}
+	}
+}
+
+// WhatsApp Web leaves its sending device out of a status's <participants> (captures 2026-05-19
+// and 2026-11-06); our 11-06 handset test listed the sending worker 31482697482258:13 among the
+// recipients. Only the sending device goes: the account's other devices (the phone, an iPad)
+// stay, or the status would not show on the user's own phone.
+func TestWithoutSendingDevice(t *testing.T) {
+	ownPN := types.JID{User: "2348105300696", Server: types.DefaultUserServer, Device: 13}
+	cli := &Client{Store: &store.Device{ID: &ownPN, LID: types.JID{User: "31482697482258", Server: types.HiddenUserServer, Device: 13}}}
+	lidDev := func(u string, d uint16) types.JID {
+		return types.JID{User: u, Server: types.HiddenUserServer, Device: d}
+	}
+
+	in := []types.JID{
+		lidDev("31482697482258", 0), lidDev("31482697482258", 1), lidDev("31482697482258", 9),
+		lidDev("31482697482258", 13), // the sending device, LID form
+		{User: "2348105300696", Server: types.DefaultUserServer, Device: 13, RawAgent: 0}, // and phone form
+		lidDev("58587783151865", 0), lidDev("58587783151865", 13), // someone else's device 13 stays
+	}
+	got := cli.withoutSendingDevice(append([]types.JID(nil), in...))
+	want := []types.JID{
+		lidDev("31482697482258", 0), lidDev("31482697482258", 1), lidDev("31482697482258", 9),
+		lidDev("58587783151865", 0), lidDev("58587783151865", 13),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
 		}
 	}
 }

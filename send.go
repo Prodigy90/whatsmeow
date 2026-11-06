@@ -416,6 +416,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 					err = fmt.Errorf("LID-addressed status send without an own LID: %w", ErrNotLoggedIn)
 					return
 				}
+				extraParams.statusWebShape = true
 			}
 		}
 		resp.DebugTimings.GetParticipants = time.Since(start)
@@ -891,6 +892,11 @@ type nodeExtraParams struct {
 	addressingMode  types.AddressingMode
 	excludeDevices  []types.JID
 	peerRecipientPN types.JID
+	// statusWebShape builds a status@broadcast stanza the way WhatsApp Web does (captured
+	// 2026-11-06, WA Web 2.3000.1052630229): the root tag is <status>, not <message>, and the
+	// sending device is left out of <participants> (our other devices stay, so the status still
+	// shows on the user's own phone). Only set with StatusLIDAddressing.
+	statusWebShape bool
 }
 
 func (cli *Client) sendGroup(
@@ -1391,6 +1397,10 @@ func (cli *Client) prepareMessageNode(
 		})
 	}
 
+	if extraParams.statusWebShape {
+		allDevices = cli.withoutSendingDevice(allDevices)
+	}
+
 	msgType := getTypeFromMessage(message)
 	encAttrs := waBinary.Attrs{}
 	// Only include encMediaType for 1:1 messages (groups don't have a device-sent message plaintext)
@@ -1433,8 +1443,12 @@ func (cli *Client) prepareMessageNode(
 		Tag:     "participants",
 		Content: participantNodes,
 	}
+	rootTag := "message"
+	if extraParams.statusWebShape {
+		rootTag = "status"
+	}
 	return &waBinary.Node{
-		Tag:   "message",
+		Tag:   rootTag,
 		Attrs: attrs,
 		Content: cli.getMessageContent(
 			participantNode, message, attrs,
@@ -1442,6 +1456,19 @@ func (cli *Client) prepareMessageNode(
 			extraParams,
 		),
 	}, allDevices, nil
+}
+
+// withoutSendingDevice drops this client's own device, in both its phone and LID form, from a
+// device list. WhatsApp Web never lists its sending device among a status's recipients.
+func (cli *Client) withoutSendingDevice(devices []types.JID) []types.JID {
+	ownPN := cli.getOwnID()
+	ownLID := cli.getOwnLID()
+	same := func(a, b types.JID) bool {
+		return !b.IsEmpty() && a.User == b.User && a.Server == b.Server && a.Device == b.Device
+	}
+	return slices.DeleteFunc(devices, func(jid types.JID) bool {
+		return same(jid, ownPN) || same(jid, ownLID)
+	})
 }
 
 func marshalMessage(to types.JID, message *waE2E.Message) (plaintext, dsmPlaintext []byte, err error) {
