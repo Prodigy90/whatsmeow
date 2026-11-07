@@ -208,6 +208,12 @@ type SendRequestExtra struct {
 	ExcludeDevices []types.JID
 
 	CheckPermissions bool
+
+	// GroupStatus posts the message as a group status (the status ring on a group) instead of a
+	// chat message. The recipient must be a group. The message should already be wrapped in
+	// GroupStatusMessageV2 with ContextInfo.IsGroupStatus and a GROUP_STATUS attribution, as the
+	// phone sends it; this flag only changes the stanza, which is sent as <status> instead of <message>.
+	GroupStatus bool
 }
 
 // SendMessage sends the given message.
@@ -285,6 +291,13 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	isBotMode := isInlineBotMode || to.IsBot()
 	needsMessageSecret := isBotMode || cli.shouldIncludeReportingToken(message)
 	var extraParams nodeExtraParams
+	if req.GroupStatus {
+		if to.Server != types.GroupServer {
+			err = fmt.Errorf("group status can only be sent to a group, got %s", to.Server)
+			return
+		}
+		extraParams.groupStatus = true
+	}
 
 	if needsMessageSecret {
 		if message.MessageContextInfo == nil {
@@ -852,6 +865,7 @@ type nodeExtraParams struct {
 	addressingMode  types.AddressingMode
 	excludeDevices  []types.JID
 	peerRecipientPN types.JID
+	groupStatus     bool
 }
 
 func (cli *Client) sendGroup(
@@ -917,6 +931,10 @@ func (cli *Client) sendGroup(
 		skMsg.Attrs["mediatype"] = mediaType
 	}
 	node.Content = append(node.GetChildren(), skMsg)
+	if extraParams.groupStatus {
+		// Same content as a group message, top-level tag <status> (captured from the phone).
+		node.Tag = "status"
+	}
 	if cli.shouldIncludeReportingToken(message) && message.GetMessageContextInfo().GetMessageSecret() != nil {
 		node.Content = append(node.GetChildren(), cli.getMessageReportingToken(plaintext, message, ownID, to, id))
 	}
@@ -1031,6 +1049,8 @@ func getTypeFromMessage(msg *waE2E.Message) string {
 		return getTypeFromMessage(msg.EphemeralMessage.Message)
 	case msg.DocumentWithCaptionMessage != nil:
 		return getTypeFromMessage(msg.DocumentWithCaptionMessage.Message)
+	case msg.GroupStatusMessageV2 != nil:
+		return getTypeFromMessage(msg.GroupStatusMessageV2.Message)
 	case msg.ReactionMessage != nil, msg.EncReactionMessage != nil:
 		return "reaction"
 	case msg.PollCreationMessage != nil, msg.PollUpdateMessage != nil:
@@ -1096,6 +1116,8 @@ func getMediaTypeFromMessage(msg *waE2E.Message) string {
 		return getMediaTypeFromMessage(msg.EphemeralMessage.Message)
 	case msg.DocumentWithCaptionMessage != nil:
 		return getMediaTypeFromMessage(msg.DocumentWithCaptionMessage.Message)
+	case msg.GroupStatusMessageV2 != nil:
+		return getMediaTypeFromMessage(msg.GroupStatusMessageV2.Message)
 	case msg.ExtendedTextMessage != nil && msg.ExtendedTextMessage.Title != nil:
 		return "url"
 	case msg.ImageMessage != nil:

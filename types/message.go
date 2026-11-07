@@ -112,6 +112,9 @@ type MessageInfo struct {
 	MsgMetaInfo MsgMetaInfo
 
 	IsNewsletterStatus bool
+	// IsGroupStatus is set for a status posted to a group (the status ring on a group),
+	// which arrives as a <status> stanza from the group instead of a <message>.
+	IsGroupStatus bool
 
 	VerifiedName   *VerifiedName
 	DeviceSentMeta *DeviceSentMeta // Metadata for direct messages sent from another one of the user's own devices.

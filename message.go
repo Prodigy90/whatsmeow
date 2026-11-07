@@ -49,6 +49,10 @@ func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.No
 		cli.sendAck(ctx, node, NackParsingError)
 		return
 	}
+	cli.handleDecryptableMessageInfo(ctx, info, node)
+}
+
+func (cli *Client) handleDecryptableMessageInfo(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) {
 	if !info.SenderAlt.IsEmpty() {
 		cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
 	} else if !info.RecipientAlt.IsEmpty() {
@@ -74,6 +78,15 @@ func (cli *Client) handleUnencryptedMessage(ctx context.Context, node *waBinary.
 	if err != nil {
 		cli.Log.Warnf("Failed to parse message: %v", err)
 		cli.sendAck(ctx, node, NackParsingError)
+		return
+	}
+	if info.Chat.Server == types.GroupServer {
+		// A group status (the status ring on a group) arrives as a top-level <status> stanza
+		// from the group, encrypted with the group's sender key like a normal group message.
+		// WA Web classifies it the same way (WAWebCommsClassifyStatusStanza: from mixin
+		// "FromGroup" => isGroupStatus). Decrypt it through the normal path instead of dropping it.
+		info.IsGroupStatus = true
+		cli.handleDecryptableMessageInfo(ctx, info, node)
 		return
 	}
 	if info.Sender.Server != types.NewsletterServer {
