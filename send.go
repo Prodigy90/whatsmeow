@@ -212,7 +212,7 @@ type SendRequestExtra struct {
 	// GroupStatus posts the message as a group status (the status ring on a group) instead of a
 	// chat message. The recipient must be a group. The message should already be wrapped in
 	// GroupStatusMessageV2 with ContextInfo.IsGroupStatus and a GROUP_STATUS attribution, as the
-	// phone sends it; this flag only changes the stanza, which is sent as <status> instead of <message>.
+	// phone sends it; this flag adds <meta is_group_status="true"> to the group <message>.
 	GroupStatus bool
 }
 
@@ -436,6 +436,16 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			extraParams.metaNode.Attrs["thread_msg_id"] = req.Meta.ThreadMessageID
 			extraParams.metaNode.Attrs["thread_msg_sender_jid"] = req.Meta.ThreadMessageSenderJID
 		}
+	}
+
+	if extraParams.groupStatus {
+		// WA Web marks every send about a group status with <meta is_group_status="true">
+		// on a normal group <message> (WAWebSendMsgMetaNode); the server then delivers it to
+		// members as a <status> stanza. Sending <status to=group> directly is rejected (479).
+		if extraParams.metaNode == nil {
+			extraParams.metaNode = &waBinary.Node{Tag: "meta", Attrs: waBinary.Attrs{}}
+		}
+		extraParams.metaNode.Attrs["is_group_status"] = "true"
 	}
 
 	if req.AdditionalNodes != nil {
@@ -931,10 +941,6 @@ func (cli *Client) sendGroup(
 		skMsg.Attrs["mediatype"] = mediaType
 	}
 	node.Content = append(node.GetChildren(), skMsg)
-	if extraParams.groupStatus {
-		// Same content as a group message, top-level tag <status> (captured from the phone).
-		node.Tag = "status"
-	}
 	if cli.shouldIncludeReportingToken(message) && message.GetMessageContextInfo().GetMessageSecret() != nil {
 		node.Content = append(node.GetChildren(), cli.getMessageReportingToken(plaintext, message, ownID, to, id))
 	}
