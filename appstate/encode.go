@@ -47,16 +47,17 @@ type PatchInfo struct {
 //
 // It sends no LID; prefer BuildContactWithLID when the contact's LID is known.
 func BuildContact(target types.JID, fullName string, add bool) PatchInfo {
-	return BuildContactWithLID(target, types.EmptyJID, fullName, add)
+	return BuildContactWithLID(target, types.EmptyJID, fullName, "", add)
 }
 
-// BuildContactWithLID is BuildContact plus the contact's LID, written into
-// ContactAction.lidJid the way WhatsApp Web does (WAWebContactSync
+// BuildContactWithLID is BuildContact plus the contact's LID and first name, written
+// into ContactAction.lidJid and firstName the way WhatsApp Web does (WAWebContactSync
 // getContactSyncMutation: the index is the phone-number JID, lidJid rides alongside).
+// An empty firstName is left out.
 // Other devices use it to tie the phone-number contact to a chat they hold under the
 // LID. An empty lid is left out, and a remove never carries one (WA Web sends only the
 // index on delete).
-func BuildContactWithLID(target, lid types.JID, fullName string, add bool) PatchInfo {
+func BuildContactWithLID(target, lid types.JID, fullName, firstName string, add bool) PatchInfo {
 	operation := waServerSync.SyncdMutation_SET
 	if !add {
 		operation = waServerSync.SyncdMutation_REMOVE
@@ -64,6 +65,9 @@ func BuildContactWithLID(target, lid types.JID, fullName string, add bool) Patch
 	action := &waSyncAction.ContactAction{
 		FullName:                 &fullName,
 		SaveOnPrimaryAddressbook: proto.Bool(add),
+	}
+	if add && firstName != "" {
+		action.FirstName = proto.String(firstName)
 	}
 	if add && !lid.IsEmpty() && lid.Server == types.HiddenUserServer {
 		action.LidJID = proto.String(lid.ToNonAD().String())
