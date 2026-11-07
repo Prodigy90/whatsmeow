@@ -44,10 +44,29 @@ type PatchInfo struct {
 // (add=false) a contact in the user's WhatsApp address book (critical_unblock_low
 // collection). Ported from tulir/whatsmeow#749. SaveOnPrimaryAddressbook asks the
 // primary device to also persist it to its local address book.
+//
+// It sends no LID; prefer BuildContactWithLID when the contact's LID is known.
 func BuildContact(target types.JID, fullName string, add bool) PatchInfo {
+	return BuildContactWithLID(target, types.EmptyJID, fullName, add)
+}
+
+// BuildContactWithLID is BuildContact plus the contact's LID, written into
+// ContactAction.lidJid the way WhatsApp Web does (WAWebContactSync
+// getContactSyncMutation: the index is the phone-number JID, lidJid rides alongside).
+// Other devices use it to tie the phone-number contact to a chat they hold under the
+// LID. An empty lid is left out, and a remove never carries one (WA Web sends only the
+// index on delete).
+func BuildContactWithLID(target, lid types.JID, fullName string, add bool) PatchInfo {
 	operation := waServerSync.SyncdMutation_SET
 	if !add {
 		operation = waServerSync.SyncdMutation_REMOVE
+	}
+	action := &waSyncAction.ContactAction{
+		FullName:                 &fullName,
+		SaveOnPrimaryAddressbook: proto.Bool(add),
+	}
+	if add && !lid.IsEmpty() && lid.Server == types.HiddenUserServer {
+		action.LidJID = proto.String(lid.ToNonAD().String())
 	}
 	return PatchInfo{
 		Type:      WAPatchCriticalUnblockLow,
@@ -56,10 +75,7 @@ func BuildContact(target types.JID, fullName string, add bool) PatchInfo {
 			Index:   []string{IndexContact, target.String()},
 			Version: 2,
 			Value: &waSyncAction.SyncActionValue{
-				ContactAction: &waSyncAction.ContactAction{
-					FullName:                 &fullName,
-					SaveOnPrimaryAddressbook: proto.Bool(add),
-				},
+				ContactAction: action,
 			},
 		}},
 	}
