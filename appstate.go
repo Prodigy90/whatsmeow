@@ -11,7 +11,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -793,20 +792,11 @@ func (cli *Client) storeContactSyncLIDs(ctx context.Context, mutations []appstat
 // is a bare LID user or a full "@lid" JID; accept both. Only phone-number
 // contacts map, as in WA Web.
 func contactSyncLIDMapping(pn types.JID, lidStr string) (store.LIDMapping, bool) {
-	if lidStr == "" || pn.Server != types.DefaultUserServer || pn.User == "" {
+	if pn.Server != types.DefaultUserServer || pn.User == "" {
 		return store.LIDMapping{}, false
 	}
-	var lid types.JID
-	if strings.ContainsRune(lidStr, '@') {
-		parsed, err := types.ParseJID(lidStr)
-		if err != nil || parsed.Server != types.HiddenUserServer {
-			return store.LIDMapping{}, false
-		}
-		lid = parsed.ToNonAD()
-	} else {
-		lid = types.NewJID(lidStr, types.HiddenUserServer)
-	}
-	if lid.User == "" {
+	lid, ok := parseUserLID(lidStr)
+	if !ok {
 		return store.LIDMapping{}, false
 	}
 	return store.LIDMapping{LID: lid, PN: pn.ToNonAD()}, true
