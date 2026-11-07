@@ -19,14 +19,25 @@ import (
 // exact pairs a code path tried to persist.
 type recordingLIDStore struct {
 	store.LIDStore
-	mu  sync.Mutex
-	put [][2]types.JID
+	mu      sync.Mutex
+	put     [][2]types.JID
+	batches int
 }
 
 func (r *recordingLIDStore) PutLIDMapping(ctx context.Context, lid, pn types.JID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.put = append(r.put, [2]types.JID{lid, pn})
+	return nil
+}
+
+func (r *recordingLIDStore) PutManyLIDMappings(ctx context.Context, mappings []store.LIDMapping) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, m := range mappings {
+		r.put = append(r.put, [2]types.JID{m.LID, m.PN})
+	}
+	r.batches++
 	return nil
 }
 

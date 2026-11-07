@@ -761,6 +761,14 @@ func (cli *Client) cacheGroupInfo(groupInfo *types.GroupInfo, lock bool) ([]stor
 			})
 		}
 	}
+	if len(participants) == 0 {
+		// Every group lists at least the user. An empty list means the
+		// response left the members out (GetJoinedGroups does this for some
+		// phone-number-addressed groups); caching it would make the next send
+		// go out addressed to nobody (ack 479). Leave the group uncached so the
+		// send path looks it up on its own.
+		return lidPairs, redactedPhones
+	}
 	if lock {
 		cli.groupCacheLock.Lock()
 		defer cli.groupCacheLock.Unlock()

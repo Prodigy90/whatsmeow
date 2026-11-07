@@ -191,6 +191,9 @@ func (cli *Client) collectEventsToDispatch(
 	fullSync bool,
 	eventsToDispatch *[]any,
 ) error {
+	if name == appstate.WAPatchCriticalUnblockLow {
+		cli.storeContactSyncLIDs(ctx, mutations, fullSync)
+	}
 	if name == appstate.WAPatchCriticalUnblockLow && fullSync && !cli.EmitAppStateEventsOnFullSync {
 		var contacts []store.ContactEntry
 		mutations, contacts = cli.filterContacts(mutations)
@@ -746,4 +749,55 @@ func BuildAppStateRecoveryRequest(collection appstate.WAPatchName) *waE2E.Messag
 			},
 		},
 	}
+}
+
+// storeContactSyncLIDs stores the LID that contact sync sends with every
+// address-book contact (ContactAction.lidJid). Upstream keeps only the name.
+//
+// WhatsApp Web's WAWebContactSync turns the same field into
+// createLidPnMappings({learningSource: "contact-sync"}), only when the index
+// JID is a regular phone-number user, and that is where it learns most of its
+// mappings: on the founder's fresh link (2026-11-06) ~12,850 of them landed
+// 4-9 s after linking, while critical_unblock_low applied, before any usync
+// answer.
+//
+// One batched write per app-state batch rather than one per contact: a fresh
+// link carries thousands of contacts, and this runs before both the
+// mass-insert full-sync path and the per-mutation path.
+func (cli *Client) storeContactSyncLIDs(ctx context.Context, mutations []appstate.Mutation, fullSync bool) {
+	var mappings []store.LIDMapping
+	for _, mutation := range mutations {
+		if mutation.Operation != waServerSync.SyncdMutation_SET || len(mutation.Index) < 2 || mutation.Index[0] != appstate.IndexContact {
+			continue
+		}
+		pn, err := types.ParseJID(mutation.Index[1])
+		if err != nil {
+			continue
+		}
+		if m, ok := contactSyncLIDMapping(pn, mutation.Action.GetContactAction().GetLidJID()); ok {
+			mappings = append(mappings, m)
+		}
+	}
+	if len(mappings) == 0 {
+		return
+	}
+	if err := cli.Store.LIDs.PutManyLIDMappings(ctx, mappings); err != nil {
+		cli.Log.Errorf("Failed to store %d contact-sync LID mappings: %v", len(mappings), err)
+		return
+	}
+	cli.Log.Debugf("Stored %d contact-sync LID mappings (full_sync=%t)", len(mappings), fullSync)
+}
+
+// contactSyncLIDMapping pairs a contact's index JID with its lidJid. The field
+// is a bare LID user or a full "@lid" JID; accept both. Only phone-number
+// contacts map, as in WA Web.
+func contactSyncLIDMapping(pn types.JID, lidStr string) (store.LIDMapping, bool) {
+	if pn.Server != types.DefaultUserServer || pn.User == "" {
+		return store.LIDMapping{}, false
+	}
+	lid, ok := parseUserLID(lidStr)
+	if !ok {
+		return store.LIDMapping{}, false
+	}
+	return store.LIDMapping{LID: lid, PN: pn.ToNonAD()}, true
 }
