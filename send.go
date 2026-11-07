@@ -442,10 +442,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		// WA Web marks every send about a group status with <meta is_group_status="true">
 		// on a normal group <message> (WAWebSendMsgMetaNode); the server then delivers it to
 		// members as a <status> stanza. Sending <status to=group> directly is rejected (479).
-		if extraParams.metaNode == nil {
-			extraParams.metaNode = &waBinary.Node{Tag: "meta", Attrs: waBinary.Attrs{}}
-		}
-		extraParams.metaNode.Attrs["is_group_status"] = "true"
+		extraParams.metaNode = groupStatusMetaNode(extraParams.metaNode)
 	}
 
 	if req.AdditionalNodes != nil {
@@ -866,6 +863,16 @@ func (cli *Client) sendNewsletter(
 		return nil, fmt.Errorf("failed to send message node: %w", err)
 	}
 	return data, nil
+}
+
+// groupStatusMetaNode marks a group send as a group status: <meta is_group_status="true">,
+// added to an existing meta node when there is one.
+func groupStatusMetaNode(meta *waBinary.Node) *waBinary.Node {
+	if meta == nil {
+		meta = &waBinary.Node{Tag: "meta", Attrs: waBinary.Attrs{}}
+	}
+	meta.Attrs["is_group_status"] = "true"
+	return meta
 }
 
 type nodeExtraParams struct {

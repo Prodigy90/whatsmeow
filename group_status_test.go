@@ -7,6 +7,7 @@ import (
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -69,5 +70,48 @@ func TestUnwrapRawGroupStatus(t *testing.T) {
 	}
 	if !evt.Message.GetExtendedTextMessage().GetContextInfo().GetIsGroupStatus() {
 		t.Error("inner contextInfo lost")
+	}
+}
+
+func groupStatusTestClient() *Client {
+	own := types.NewADJID("2348105300696", 0, 14)
+	return &Client{Store: &store.Device{ID: &own, LID: types.NewADJID("31482697482258", 0, 14).ToNonAD()}}
+}
+
+// Our own devices' copy of a group status (and every send about one) is a group <message>
+// with <meta is_group_status="true">; it must come out flagged, or the worker gate misses it.
+func TestParseMessageInfoMetaIsGroupStatus(t *testing.T) {
+	cli := groupStatusTestClient()
+	group := types.NewJID("120363414701935822", types.GroupServer)
+	mk := func(meta waBinary.Attrs) *waBinary.Node {
+		return &waBinary.Node{Tag: "message", Attrs: waBinary.Attrs{
+			"from": group, "id": "3CEE8D4CEDAA44EDA181A70A2DC4D0E7", "t": "1794039607", "type": "media",
+			"participant": types.NewADJID("31482697482258", 0, 9).ToNonAD(), "addressing_mode": "lid",
+		}, Content: []waBinary.Node{{Tag: "meta", Attrs: meta}}}
+	}
+	info, err := cli.parseMessageInfo(mk(waBinary.Attrs{"is_group_status": "true"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsGroupStatus {
+		t.Error("meta is_group_status=true not flagged")
+	}
+	info, err = cli.parseMessageInfo(mk(waBinary.Attrs{"appdata": "default"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.IsGroupStatus {
+		t.Error("plain group message flagged as group status")
+	}
+}
+
+func TestRetryExtraParamsKeepGroupStatusMeta(t *testing.T) {
+	gs := wrapGroupStatus(&waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String("hi")}})
+	p := retryExtraParams(gs)
+	if p.metaNode == nil || p.metaNode.Attrs["is_group_status"] != "true" {
+		t.Fatalf("group status resend lost its meta flag: %+v", p.metaNode)
+	}
+	if p := retryExtraParams(&waE2E.Message{Conversation: proto.String("hi")}); p.metaNode != nil {
+		t.Errorf("plain message resend got a meta node: %+v", p.metaNode)
 	}
 }

@@ -278,6 +278,14 @@ func (cli *Client) parseMessageInfo(node *waBinary.Node) (*types.MessageInfo, er
 				cli.Log.Warnf("Failed to parse <bot> node in %s: %v", info.ID, err)
 			}
 		case "meta":
+			// A group status sent by one of our own devices (or any send about a group
+			// status) is a group <message> with <meta is_group_status="true">; only members
+			// receive it as a <status> stanza. Read the flag off this node directly:
+			// parseMsgMetaInfo looks for a <meta> child INSIDE the meta node (same upstream),
+			// so it never sees these attributes.
+			if child.AttrGetter().OptionalString("is_group_status") == "true" {
+				info.IsGroupStatus = true
+			}
 			info.MsgMetaInfo, err = cli.parseMsgMetaInfo(child)
 			if err != nil {
 				cli.Log.Warnf("Failed to parse <meta> node in %s: %v", info.ID, err)
