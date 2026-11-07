@@ -11,7 +11,7 @@ func TestBuildContactWithLIDCarriesLID(t *testing.T) {
 	lid := types.NewJID("123966379274271", types.HiddenUserServer)
 	lid.Device = 7 // a device-qualified LID must be sent as the user JID
 
-	act := BuildContactWithLID(pn, lid, "Tttt VIP", true).Mutations[0]
+	act := BuildContactWithLID(pn, lid, "Tttt VIP", "Tttt", true).Mutations[0]
 	if got := act.Index[1]; got != "19472705982@s.whatsapp.net" {
 		t.Fatalf("index must stay the phone-number JID, got %q", got)
 	}
@@ -21,19 +21,25 @@ func TestBuildContactWithLIDCarriesLID(t *testing.T) {
 	if act.Value.GetContactAction().GetFullName() != "Tttt VIP" {
 		t.Fatal("full name lost")
 	}
+	if act.Value.GetContactAction().GetFirstName() != "Tttt" {
+		t.Fatalf("firstName = %q, want Tttt", act.Value.GetContactAction().GetFirstName())
+	}
 }
 
 func TestBuildContactWithLIDOmitsLIDWhenAbsentOrInvalid(t *testing.T) {
 	pn := types.NewJID("19472705982", types.DefaultUserServer)
 	cases := map[string]PatchInfo{
-		"no lid":           BuildContactWithLID(pn, types.EmptyJID, "X", true),
+		"no lid":           BuildContactWithLID(pn, types.EmptyJID, "X", "", true),
 		"plain wrapper":    BuildContact(pn, "X", true),
-		"pn passed as lid": BuildContactWithLID(pn, pn, "X", true),
-		"remove":           BuildContactWithLID(pn, types.NewJID("1", types.HiddenUserServer), "X", false),
+		"pn passed as lid": BuildContactWithLID(pn, pn, "X", "", true),
+		"remove":           BuildContactWithLID(pn, types.NewJID("1", types.HiddenUserServer), "X", "X", false),
 	}
 	for name, p := range cases {
 		if p.Mutations[0].Value.GetContactAction().LidJID != nil {
 			t.Errorf("%s: lidJid must be omitted", name)
+		}
+		if p.Mutations[0].Value.GetContactAction().FirstName != nil {
+			t.Errorf("%s: firstName must be omitted", name)
 		}
 	}
 }
