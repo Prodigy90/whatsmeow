@@ -207,7 +207,34 @@ type SendRequestExtra struct {
 	// without having to remove the underlying contact from the audience.
 	ExcludeDevices []types.JID
 
+	// StatusLIDAddressing sends a status@broadcast message addressed entirely in LID space, the
+	// way WhatsApp Web does: every Participants entry must be an @lid user (the caller converts
+	// phone numbers, including its own, before sending), and the message is sent as our own LID.
+	// A participant in any other form makes SendMessage fail before anything goes on the wire,
+	// because a stanza mixing LID and phone addressing is rejected as a whole (<ack error="400">).
+	// Ignored for every other destination.
+	StatusLIDAddressing bool
+
 	CheckPermissions bool
+}
+
+// ErrStatusMixedAddressing is returned when a LID-addressed status send is given a participant
+// that is not an @lid user.
+var ErrStatusMixedAddressing = errors.New("LID-addressed status send has a participant that is not an @lid user")
+
+// checkStatusLIDParticipants reports the first participant of a LID-addressed status send that
+// is not a plain @lid user JID. Device suffixes are refused too: the participant list names
+// people, GetUserDevices expands them to devices.
+func checkStatusLIDParticipants(participants []types.JID) error {
+	if len(participants) == 0 {
+		return fmt.Errorf("%w: no participants", ErrStatusMixedAddressing)
+	}
+	for _, jid := range participants {
+		if jid.Server != types.HiddenUserServer || jid.User == "" || jid.Device != 0 {
+			return fmt.Errorf("%w: %s", ErrStatusMixedAddressing, jid)
+		}
+	}
+	return nil
 }
 
 // SendMessage sends the given message.
@@ -377,6 +404,19 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 					err = fmt.Errorf("failed to get broadcast list members: %w", err)
 					return
 				}
+			}
+			if req.StatusLIDAddressing && to == types.StatusBroadcastJID {
+				if err = checkStatusLIDParticipants(groupParticipants); err != nil {
+					return
+				}
+				// Same as a LID-addressed group above: the message goes out as our LID, which
+				// is the identity the reporting token and the stored message secret are keyed on.
+				ownID = cli.getOwnLID()
+				if ownID.IsEmpty() {
+					err = fmt.Errorf("LID-addressed status send without an own LID: %w", ErrNotLoggedIn)
+					return
+				}
+				extraParams.statusWebShape = true
 			}
 		}
 		resp.DebugTimings.GetParticipants = time.Since(start)
@@ -852,6 +892,14 @@ type nodeExtraParams struct {
 	addressingMode  types.AddressingMode
 	excludeDevices  []types.JID
 	peerRecipientPN types.JID
+	// statusWebShape builds a status@broadcast stanza the way WhatsApp Web does (captured
+	// 2026-11-06, WA Web 2.3000.1052630229): the root tag is <status>, not <message>, and the
+	// sending device is left out of <participants> (our other devices stay, so the status still
+	// shows on the user's own phone). Only set with StatusLIDAddressing.
+	statusWebShape bool
+	// statusBareRevoke sends a statusWebShape delete in WA Web's bare form (sendGroup sets it
+	// only when our status sender key is stored, so every recipient can decrypt the skmsg).
+	statusBareRevoke bool
 }
 
 func (cli *Client) sendGroup(
@@ -874,6 +922,16 @@ func (cli *Client) sendGroup(
 	start = time.Now()
 	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
 	senderKeyName := protocol.NewSenderKeyName(to.String(), cli.getOwnLID().SignalAddress())
+	if extraParams.statusWebShape && getEditAttribute(message) == types.EditAttributeSenderRevoke {
+		// The bare WA Web delete works only because every recipient already holds the sender key
+		// the original post was distributed under. With no stored key, builder.Create below makes
+		// a fresh one nobody has: the delete would be accepted and undecryptable, and the status
+		// would stay up. Fall back to the per-device delete then, as WA Web does after a reset.
+		extraParams.statusBareRevoke = cli.hasStoredSenderKey(ctx, senderKeyName)
+		if !extraParams.statusBareRevoke {
+			cli.Log.Warnf("No stored status sender key for %s, sending delete %s per device", senderKeyName.Sender(), id)
+		}
+	}
 	signalSKDMessage, err := builder.Create(ctx, senderKeyName)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create sender key distribution message to send %s to %s: %w", id, to, err)
@@ -917,8 +975,12 @@ func (cli *Client) sendGroup(
 		skMsg.Attrs["mediatype"] = mediaType
 	}
 	node.Content = append(node.GetChildren(), skMsg)
-	if cli.shouldIncludeReportingToken(message) && message.GetMessageContextInfo().GetMessageSecret() != nil {
+	webRevoke := extraParams.statusWebShape && node.Attrs["edit"] != nil
+	if !webRevoke && cli.shouldIncludeReportingToken(message) && message.GetMessageContextInfo().GetMessageSecret() != nil {
 		node.Content = append(node.GetChildren(), cli.getMessageReportingToken(plaintext, message, ownID, to, id))
+	}
+	if extraParams.statusWebShape && !webRevoke {
+		node.Content = orderStatusChildren(node.GetChildren())
 	}
 
 	start = time.Now()
@@ -1323,6 +1385,10 @@ func (cli *Client) prepareMessageNode(
 	timings *MessageDebugTimings,
 	extraParams nodeExtraParams,
 ) (*waBinary.Node, []types.JID, error) {
+	if extraParams.statusBareRevoke {
+		return cli.prepareStatusWebRevokeNode(to, id, message, participants)
+	}
+
 	start := time.Now()
 	allDevices, err := cli.GetUserDevices(ctx, participants)
 	timings.GetDevices = time.Since(start)
@@ -1350,6 +1416,10 @@ func (cli *Client) prepareMessageNode(
 			_, drop := excluded[jid.ToNonAD()]
 			return drop
 		})
+	}
+
+	if extraParams.statusWebShape {
+		allDevices = cli.withoutSendingDevice(allDevices)
 	}
 
 	msgType := getTypeFromMessage(message)
@@ -1390,12 +1460,19 @@ func (cli *Client) prepareMessageNode(
 	if err != nil {
 		return nil, nil, err
 	}
+	if extraParams.statusWebShape {
+		participantNodes = bareEntryLastPerUser(participantNodes)
+	}
 	participantNode := waBinary.Node{
 		Tag:     "participants",
 		Content: participantNodes,
 	}
+	rootTag := "message"
+	if extraParams.statusWebShape {
+		rootTag = "status"
+	}
 	return &waBinary.Node{
-		Tag:   "message",
+		Tag:   rootTag,
 		Attrs: attrs,
 		Content: cli.getMessageContent(
 			participantNode, message, attrs,
@@ -1403,6 +1480,111 @@ func (cli *Client) prepareMessageNode(
 			extraParams,
 		),
 	}, allDevices, nil
+}
+
+// prepareStatusWebRevokeNode builds a status delete the way WhatsApp Web does
+// (WAWebEncryptAndSendStatusMsg + WASmaxOutStatusPublishStatusRevokeMixin, capture
+// 2026-11-06 line 1371): <status edit="7"> listing each recipient once as a bare user LID,
+// with only the sender-key <enc type="skmsg"> appended by the caller. Every recipient already
+// holds our status sender key from the original post, so nothing is re-encrypted per device,
+// no device list is fetched, and there is no <meta>, <device-identity> or reporting token.
+func (cli *Client) prepareStatusWebRevokeNode(
+	to types.JID, id types.MessageID, message *waE2E.Message, participants []types.JID,
+) (*waBinary.Node, []types.JID, error) {
+	seen := make(map[string]struct{}, len(participants))
+	nodes := make([]waBinary.Node, 0, len(participants))
+	users := make([]types.JID, 0, len(participants))
+	for _, p := range participants {
+		user := p.ToNonAD()
+		if _, dup := seen[user.User]; dup {
+			continue
+		}
+		seen[user.User] = struct{}{}
+		users = append(users, user)
+		nodes = append(nodes, waBinary.Node{Tag: "to", Attrs: waBinary.Attrs{"jid": user}})
+	}
+	return &waBinary.Node{
+		Tag: "status",
+		Attrs: waBinary.Attrs{
+			"id":   id,
+			"to":   to,
+			"edit": string(types.EditAttributeSenderRevoke),
+			"type": getTypeFromMessage(message),
+		},
+		Content: []waBinary.Node{{Tag: "participants", Content: nodes}},
+	}, users, nil
+}
+
+// statusChildRank is WhatsApp Web's child order on a status post (capture 2026-11-06 lines
+// 1156/1236/1278): reporting, participants, enc skmsg, meta, device-identity.
+var statusChildRank = map[string]int{"reporting": 0, "participants": 1, "enc": 2, "meta": 3, "device-identity": 4}
+
+func orderStatusChildren(children []waBinary.Node) []waBinary.Node {
+	out := slices.Clone(children)
+	slices.SortStableFunc(out, func(a, b waBinary.Node) int {
+		ra, oka := statusChildRank[a.Tag]
+		rb, okb := statusChildRank[b.Tag]
+		if !oka {
+			ra = len(statusChildRank)
+		}
+		if !okb {
+			rb = len(statusChildRank)
+		}
+		return ra - rb
+	})
+	return out
+}
+
+// bareEntryLastPerUser moves each user's device-0 (bare) <to> after that user's device-suffixed
+// entries, keeping users in their original order. WhatsApp Web lists "u:1, u:2, u" where the
+// device list we get back gives "u, u:1, u:2".
+func bareEntryLastPerUser(nodes []waBinary.Node) []waBinary.Node {
+	userOf := func(n waBinary.Node) (string, uint16) {
+		jid, _ := n.Attrs["jid"].(types.JID)
+		return jid.User, jid.Device
+	}
+	out := make([]waBinary.Node, 0, len(nodes))
+	for i := 0; i < len(nodes); {
+		user, _ := userOf(nodes[i])
+		j := i
+		for j < len(nodes) {
+			if u, _ := userOf(nodes[j]); u != user {
+				break
+			}
+			j++
+		}
+		var bare []waBinary.Node
+		for _, n := range nodes[i:j] {
+			if _, dev := userOf(n); dev == 0 {
+				bare = append(bare, n)
+			} else {
+				out = append(out, n)
+			}
+		}
+		out = append(out, bare...)
+		i = j
+	}
+	return out
+}
+
+// hasStoredSenderKey reports whether our sender key for this group/broadcast is already stored,
+// i.e. whether recipients of an earlier send can decrypt a skmsg under it.
+func (cli *Client) hasStoredSenderKey(ctx context.Context, name *protocol.SenderKeyName) bool {
+	existing, err := cli.Store.SenderKeys.GetSenderKey(ctx, name.GroupID(), name.Sender().String())
+	return err == nil && len(existing) > 0
+}
+
+// withoutSendingDevice drops this client's own device, in both its phone and LID form, from a
+// device list. WhatsApp Web never lists its sending device among a status's recipients.
+func (cli *Client) withoutSendingDevice(devices []types.JID) []types.JID {
+	ownPN := cli.getOwnID()
+	ownLID := cli.getOwnLID()
+	same := func(a, b types.JID) bool {
+		return !b.IsEmpty() && a.User == b.User && a.Server == b.Server && a.Device == b.Device
+	}
+	return slices.DeleteFunc(devices, func(jid types.JID) bool {
+		return same(jid, ownPN) || same(jid, ownLID)
+	})
 }
 
 func marshalMessage(to types.JID, message *waE2E.Message) (plaintext, dsmPlaintext []byte, err error) {
