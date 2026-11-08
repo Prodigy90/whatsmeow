@@ -57,10 +57,13 @@ var (
 )
 
 const (
-	canonicalHKDFInfo       = "Canonical Ent Companion Nonce Encrypt"
-	canonicalExchangeBudget = 12 * time.Second
-	// Matches what WhatsApp Web's fetchFromXController does with retry: one retry after 2s.
-	canonicalRetryDelay = 2 * time.Second
+	canonicalHKDFInfo = "Canonical Ent Companion Nonce Encrypt"
+	// This whole operation sits between pair-success and our pair-device-sign reply,
+	// so it holds up pairing. WhatsApp Web's own gap there is ~0.22s and the measured
+	// exchange was 1.25s; cap the budget low so a slow/hung server can't stall the
+	// link past WhatsApp's own IQ timeout. One retry, short delay.
+	canonicalExchangeBudget = 4 * time.Second
+	canonicalRetryDelay     = 1 * time.Second
 )
 
 // CanonicalUserAgent is sent on the bootstrap GET and the token POST. It should
@@ -323,7 +326,7 @@ type canonicalTokenResponse struct {
 func (cli *Client) postCanonicalToken(ctx context.Context, hc *http.Client, reqURL, body, lsd string) (string, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(body))
 	if err != nil {
-		return "", false, err
+		return "", false, redactCanonicalURLError(err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", CanonicalUserAgent)
@@ -335,7 +338,7 @@ func (cli *Client) postCanonicalToken(ctx context.Context, hc *http.Client, reqU
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	resp, err := hc.Do(req)
 	if err != nil {
-		return "", true, err
+		return "", true, redactCanonicalURLError(err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -361,6 +364,17 @@ func (cli *Client) postCanonicalToken(ctx context.Context, hc *http.Client, reqU
 		return status, false, fmt.Errorf("/auth/token/ status %q (body %s)", status, truncateForLog(raw))
 	}
 	return status, false, nil
+}
+
+// redactCanonicalURLError strips the request URL from a *url.Error before it can reach
+// a log. The nonce and access token travel in the /auth/token/ query string, so the URL
+// that net/http embeds in its error message would leak them. Other errors pass through.
+func redactCanonicalURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("%s /auth/token/: %w", ue.Op, ue.Err)
+	}
+	return err
 }
 
 // truncateForLog keeps response bodies short in logs. The response does not echo

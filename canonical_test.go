@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/hkdf"
@@ -212,6 +213,25 @@ func TestCanonicalExchangeFailureStatusIsNotRetried(t *testing.T) {
 	}
 	if len(fake.posts) != 1 {
 		t.Fatalf("a definite server answer must not be retried, got %d POSTs", len(fake.posts))
+	}
+}
+
+// A network failure must never put the nonce or access token (both in the request URL's
+// query) into the error that gets logged. net/http's *url.Error embeds the full URL.
+func TestCanonicalExchangeErrorDoesNotLeakSecrets(t *testing.T) {
+	adv, noise := testKeys(t)
+	fake := &fakeWAWeb{status: "success"}
+	fake.server(t) // bootstrap GET succeeds; restores URLs on cleanup
+	canonicalTokenURL = "http://127.0.0.1:1/auth/token/"
+	cli := newCanonicalTestClient(adv, noise, CanonicalRegistrationExchange)
+	const secretNonce, secretToken = "SUPERSECRETNONCE12345", "SECRETaccesstoken999"
+	_, err := cli.exchangeCanonicalNonce(context.Background(),
+		&canonicalNoncePayload{Nonce: secretNonce, FBID: "1", AccessToken: secretToken}, 2)
+	if err == nil {
+		t.Fatal("expected a network error against a closed port")
+	}
+	if s := err.Error(); strings.Contains(s, secretNonce) || strings.Contains(s, secretToken) {
+		t.Fatalf("error leaks a secret: %q", s)
 	}
 }
 
