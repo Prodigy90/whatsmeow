@@ -50,6 +50,19 @@ const (
 	CanonicalRegistrationExchange
 )
 
+// CanonicalOutcome* are the one-word results of handleCanonicalRegistration,
+// recorded per link so the two cohorts (success vs failure) can be compared
+// against the post-link logout rate. They are plain strings so the events
+// package can carry one without importing whatsmeow.
+const (
+	CanonicalOutcomeOff            = "off"             // feature disabled
+	CanonicalOutcomeNoMetadata     = "no_metadata"     // server sent no <encryption-metadata>
+	CanonicalOutcomeDecryptFailed  = "decrypt_failed"  // block present but decrypt/parse failed
+	CanonicalOutcomeLogged         = "log_only"        // decrypted, no exchange (log mode)
+	CanonicalOutcomeExchangeFailed = "exchange_failed" // exchange attempted, server did not say success
+	CanonicalOutcomeSuccess        = "success"         // /auth/token/ returned status=success
+)
+
 // Variables rather than constants so tests can point them at a local server.
 var (
 	canonicalBaseURL  = "https://web.whatsapp.com/"
@@ -147,28 +160,29 @@ func decryptCanonicalNonce(advSecret, noisePub []byte, meta *canonicalEncryption
 	return &payload, nil
 }
 
-// handleCanonicalRegistration is called from handlePair before pair-device-sign is sent.
-// It never returns an error: like WhatsApp Web, a failure here must not stop pairing.
-func (cli *Client) handleCanonicalRegistration(ctx context.Context, pairSuccess waBinary.Node, deviceID uint16) {
+// handleCanonicalRegistration is called from completePair before pair-device-sign is
+// sent. It never returns an error: like WhatsApp Web, a failure here must not stop
+// pairing. It returns a CanonicalOutcome* string, recorded per link.
+func (cli *Client) handleCanonicalRegistration(ctx context.Context, pairSuccess waBinary.Node, deviceID uint16) string {
 	mode := cli.CanonicalRegistration
 	if mode == CanonicalRegistrationOff {
-		return
+		return CanonicalOutcomeOff
 	}
 	log := cli.Log.Sub("Canonical")
 	meta, err := parseCanonicalEncryptionMetadata(pairSuccess)
 	if err != nil {
 		log.Infof("Skipping canonical registration: %v", err)
-		return
+		return CanonicalOutcomeNoMetadata
 	}
 	payload, err := decryptCanonicalNonce(cli.Store.AdvSecretKey, cli.Store.NoiseKey.Pub[:], meta)
 	if err != nil {
 		log.Warnf("Failed to decrypt canonical nonce: %v", err)
-		return
+		return CanonicalOutcomeDecryptFailed
 	}
 	log.Infof("Decrypted canonical nonce (nonce_len=%d has_access_token=%t has_timestamp=%t device_id=%d mode=%d)",
 		len(payload.Nonce), payload.AccessToken != "", payload.Timestamp != "", deviceID, mode)
 	if mode != CanonicalRegistrationExchange {
-		return
+		return CanonicalOutcomeLogged
 	}
 	ctx, cancel := context.WithTimeout(ctx, canonicalExchangeBudget)
 	defer cancel()
@@ -176,9 +190,10 @@ func (cli *Client) handleCanonicalRegistration(ctx context.Context, pairSuccess 
 	status, err := cli.exchangeCanonicalNonce(ctx, payload, deviceID)
 	if err != nil {
 		log.Warnf("Canonical token exchange failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
-		return
+		return CanonicalOutcomeExchangeFailed
 	}
 	log.Infof("Canonical token exchange finished in %s with status %q", time.Since(start).Round(time.Millisecond), status)
+	return CanonicalOutcomeSuccess
 }
 
 var (

@@ -155,7 +155,11 @@ func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
 		} else {
 			cli.Log.Infof("Successfully paired %s", cli.Store.ID)
 			go cli.sendUnifiedSession()
-			cli.dispatchEvent(&events.PairSuccess{ID: jid, LID: lid, BusinessName: businessName, Platform: platform, Props: &props})
+			canonReg := ""
+			if p := cli.lastCanonicalReg.Load(); p != nil {
+				canonReg = *p
+			}
+			cli.dispatchEvent(&events.PairSuccess{ID: jid, LID: lid, BusinessName: businessName, Platform: platform, Props: &props, CanonicalRegistration: canonReg})
 		}
 	}()
 }
@@ -243,7 +247,8 @@ func (cli *Client) completePair(ctx context.Context, pairSuccess waBinary.Node, 
 		return &PairDatabaseError{"failed to store main device identity", err}
 	}
 
-	cli.handleCanonicalRegistration(ctx, pairSuccess, jid.Device)
+	canonicalOutcome := cli.handleCanonicalRegistration(ctx, pairSuccess, jid.Device)
+	cli.lastCanonicalReg.Store(&canonicalOutcome)
 
 	// Expect a disconnect after this and don't dispatch the usual Disconnected event
 	cli.expectDisconnect()
