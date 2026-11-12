@@ -55,6 +55,11 @@ type PairSuccess struct {
 	BusinessName string
 	Platform     string
 	Props        *waCompanionReg.ClientPairingProps
+
+	// CanonicalRegistration is the outcome of the canonical nonce exchange run
+	// during this pairing (see Client.CanonicalRegistration). One of the
+	// whatsmeow.CanonicalOutcome* string values; empty on a relink (no pairing).
+	CanonicalRegistration string
 }
 
 // PairError is emitted when a pair-success event is received from the server, but finishing the pairing locally fails.

@@ -841,9 +841,7 @@ func (cli *Client) DownloadHistorySync(ctx context.Context, notif *waE2E.History
 		if err := cli.storeNCTSalt(ctx, historySync.GetNctSalt()); err != nil {
 			cli.Log.Warnf("Failed to store NCT salt from history sync: %v", err)
 		}
-		if len(historySync.GetPhoneNumberToLidMappings()) > 0 {
-			cli.storeHistoricalPNLIDMappings(ctx, historySync.GetPhoneNumberToLidMappings())
-		}
+		cli.storeHistorySyncLIDMappings(ctx, &historySync)
 		if historySync.GetSyncType() == waHistorySync.HistorySync_PUSH_NAME {
 			cli.handleHistoricalPushNames(ctx, historySync.GetPushnames())
 		} else if len(historySync.GetConversations()) > 0 {
@@ -1183,42 +1181,7 @@ func (cli *Client) storeCompanionMetaNonce(ctx context.Context, nonce string) {
 }
 
 func (cli *Client) storeHistoricalPNLIDMappings(ctx context.Context, mappings []*waHistorySync.PhoneNumberToLIDMapping) {
-	lidPairs := make([]store.LIDMapping, 0, len(mappings))
-	for _, mapping := range mappings {
-		pn, err := types.ParseJID(mapping.GetPnJID())
-		if err != nil {
-			zerolog.Ctx(ctx).Err(err).
-				Str("pn_jid", mapping.GetPnJID()).
-				Str("lid_jid", mapping.GetLidJID()).
-				Msg("Failed to parse phone number from history sync")
-			continue
-		}
-		if pn.Server == types.LegacyUserServer {
-			pn.Server = types.DefaultUserServer
-		}
-		lid, err := types.ParseJID(mapping.GetLidJID())
-		if err != nil {
-			zerolog.Ctx(ctx).Err(err).
-				Str("pn_jid", mapping.GetPnJID()).
-				Str("lid_jid", mapping.GetLidJID()).
-				Msg("Failed to parse LID from history sync")
-			continue
-		}
-		lidPairs = append(lidPairs, store.LIDMapping{
-			LID: lid,
-			PN:  pn,
-		})
-	}
-	err := cli.Store.LIDs.PutManyLIDMappings(ctx, lidPairs)
-	if err != nil {
-		zerolog.Ctx(ctx).Err(err).
-			Int("pair_count", len(lidPairs)).
-			Msg("Failed to store phone number to LID mappings from history sync")
-	} else {
-		zerolog.Ctx(ctx).Debug().
-			Int("pair_count", len(lidPairs)).
-			Msg("Stored PN-LID mappings from history sync")
-	}
+	cli.storeHistorySyncLIDMappings(ctx, &waHistorySync.HistorySync{PhoneNumberToLidMappings: mappings})
 }
 
 func (cli *Client) handleDecryptedMessage(ctx context.Context, info *types.MessageInfo, msg *waE2E.Message, retryCount int) (handlerFailed bool) {

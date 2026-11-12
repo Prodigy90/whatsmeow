@@ -98,8 +98,12 @@ type Client struct {
 	AppStateDebugLogs            bool
 
 	AutomaticMessageRerequestFromPhone bool
-	pendingPhoneRerequests             map[types.MessageID]context.CancelFunc
-	pendingPhoneRerequestsLock         sync.RWMutex
+
+	// StatusWebShapeRetries re-sends a status@broadcast message after a retry receipt with the
+	// root tag <status>, the way WhatsApp Web does. Set it together with StatusLIDAddressing.
+	StatusWebShapeRetries      bool
+	pendingPhoneRerequests     map[types.MessageID]context.CancelFunc
+	pendingPhoneRerequestsLock sync.RWMutex
 
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
@@ -196,6 +200,13 @@ type Client struct {
 	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and
 	// the client will disconnect.
 	PrePairCallback func(jid types.JID, platform, businessName string) bool
+
+	// CanonicalRegistration controls whether the client redeems the canonical nonce in
+	// pair-success's <encryption-metadata>, as WhatsApp Web does. See canonical.go.
+	CanonicalRegistration CanonicalRegistrationMode
+	// lastCanonicalReg holds the outcome of the most recent pairing's canonical
+	// registration, set in completePair and read when the PairSuccess event is built.
+	lastCanonicalReg atomic.Pointer[string]
 
 	// GetClientPayload is called to get the client payload for connecting to the server.
 	// This should NOT be used for WhatsApp (to change the OS name, update fields in store.BaseClientPayload directly).

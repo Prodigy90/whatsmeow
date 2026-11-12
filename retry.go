@@ -409,8 +409,14 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 			{Tag: "franking", Content: []waBinary.Node{{Tag: "franking_tag", Content: frankingTag}}},
 		}
 	}
+	rootTag := "message"
+	if cli.StatusWebShapeRetries && receipt.Chat == types.StatusBroadcastJID {
+		// WhatsApp Web re-sends a status as <status> (WAWebSendRetryMsgJob), matching the
+		// shape StatusLIDAddressing posts use.
+		rootTag = "status"
+	}
 	err = cli.sendNode(ctx, waBinary.Node{
-		Tag:     "message",
+		Tag:     rootTag,
 		Attrs:   attrs,
 		Content: content,
 	})
