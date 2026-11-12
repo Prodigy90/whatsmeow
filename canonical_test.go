@@ -247,3 +247,22 @@ func TestCanonicalExchangeRetriesOnceOn5xx(t *testing.T) {
 		t.Fatalf("want exactly one retry (2 POSTs) like fetchFromXController, got %d", len(fake.posts))
 	}
 }
+
+// A block that is present but unusable is a read failure, not "the server sent
+// nothing": the two must land in different cohorts.
+func TestCanonicalOutcomeAbsentVersusMalformedBlock(t *testing.T) {
+	cli := &Client{Store: &store.Device{AdvSecretKey: make([]byte, 32), NoiseKey: keys.NewKeyPair()}, Log: waLog.Noop}
+	cli.CanonicalRegistration = CanonicalRegistrationLogOnly
+
+	absent := waBinary.Node{Tag: "pair-success"}
+	if got := cli.handleCanonicalRegistration(context.Background(), absent, 1); got != CanonicalOutcomeNoMetadata {
+		t.Fatalf("absent block: want %q, got %q", CanonicalOutcomeNoMetadata, got)
+	}
+	malformed := waBinary.Node{Tag: "pair-success", Content: []waBinary.Node{{
+		Tag:     "encryption-metadata",
+		Content: []waBinary.Node{{Tag: "nonce", Content: []byte("123456789012")}},
+	}}}
+	if got := cli.handleCanonicalRegistration(context.Background(), malformed, 1); got != CanonicalOutcomeDecryptFailed {
+		t.Fatalf("malformed block: want %q, got %q", CanonicalOutcomeDecryptFailed, got)
+	}
+}

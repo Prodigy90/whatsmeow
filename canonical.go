@@ -170,9 +170,15 @@ func (cli *Client) handleCanonicalRegistration(ctx context.Context, pairSuccess 
 	}
 	log := cli.Log.Sub("Canonical")
 	meta, err := parseCanonicalEncryptionMetadata(pairSuccess)
-	if err != nil {
+	if errors.Is(err, errCanonicalNoMetadata) {
 		log.Infof("Skipping canonical registration: %v", err)
 		return CanonicalOutcomeNoMetadata
+	} else if err != nil {
+		// The block is there but unusable (unknown algorithm, missing parts). That
+		// is a failure to read it, not an absent block, and must not be counted
+		// with the links the server sent nothing to.
+		log.Warnf("Unusable encryption-metadata in pair-success: %v", err)
+		return CanonicalOutcomeDecryptFailed
 	}
 	payload, err := decryptCanonicalNonce(cli.Store.AdvSecretKey, cli.Store.NoiseKey.Pub[:], meta)
 	if err != nil {
