@@ -201,6 +201,13 @@ type Client struct {
 	// the client will disconnect.
 	PrePairCallback func(jid types.JID, platform, businessName string) bool
 
+	// CanonicalRegistration controls whether the client redeems the canonical nonce in
+	// pair-success's <encryption-metadata>, as WhatsApp Web does. See canonical.go.
+	CanonicalRegistration CanonicalRegistrationMode
+	// lastCanonicalReg holds the outcome of the most recent pairing's canonical
+	// registration, set in completePair and read when the PairSuccess event is built.
+	lastCanonicalReg atomic.Pointer[string]
+
 	// GetClientPayload is called to get the client payload for connecting to the server.
 	// This should NOT be used for WhatsApp (to change the OS name, update fields in store.BaseClientPayload directly).
 	GetClientPayload func() *waWa6.ClientPayload

@@ -133,6 +133,7 @@ func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
 	cli.serverTimeOffset.Store(int64(node.AttrGetter().UnixTime("t").Sub(time.Now().Round(time.Second))))
 	id := node.Attrs["id"].(string)
 	pairSuccess := node.GetChildByTag("pair-success")
+	cli.Log.Infof("Received pair-success with children %v", pairSuccessChildTags(pairSuccess))
 
 	deviceIdentityBytes, _ := pairSuccess.GetChildByTag("device-identity").Content.([]byte)
 	businessName, _ := pairSuccess.GetChildByTag("biz").Attrs["name"].(string)
@@ -146,7 +147,7 @@ func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
 	}
 
 	go func() {
-		err := cli.handlePair(ctx, deviceIdentityBytes, id, businessName, platform, jid, lid)
+		err := cli.completePair(ctx, pairSuccess, deviceIdentityBytes, id, businessName, platform, jid, lid)
 		if err != nil {
 			cli.Log.Errorf("Failed to pair device: %v", err)
 			cli.Disconnect()
@@ -154,12 +155,22 @@ func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
 		} else {
 			cli.Log.Infof("Successfully paired %s", cli.Store.ID)
 			go cli.sendUnifiedSession()
-			cli.dispatchEvent(&events.PairSuccess{ID: jid, LID: lid, BusinessName: businessName, Platform: platform, Props: &props})
+			canonReg := ""
+			if p := cli.lastCanonicalReg.Load(); p != nil {
+				canonReg = *p
+			}
+			cli.dispatchEvent(&events.PairSuccess{ID: jid, LID: lid, BusinessName: businessName, Platform: platform, Props: &props, CanonicalRegistration: canonReg})
 		}
 	}()
 }
 
 func (cli *Client) handlePair(ctx context.Context, deviceIdentityBytes []byte, reqID, businessName, platform string, jid, lid types.JID) error {
+	return cli.completePair(ctx, waBinary.Node{}, deviceIdentityBytes, reqID, businessName, platform, jid, lid)
+}
+
+// completePair is handlePair plus the pair-success node, so the canonical registration
+// (see canonical.go) can run before pair-device-sign, in WhatsApp Web's order.
+func (cli *Client) completePair(ctx context.Context, pairSuccess waBinary.Node, deviceIdentityBytes []byte, reqID, businessName, platform string, jid, lid types.JID) error {
 	var deviceIdentityContainer waAdv.ADVSignedDeviceIdentityHMAC
 	err := proto.Unmarshal(deviceIdentityBytes, &deviceIdentityContainer)
 	if err != nil {
@@ -235,6 +246,9 @@ func (cli *Client) handlePair(ctx context.Context, deviceIdentityBytes []byte, r
 		cli.sendPairError(ctx, reqID, 500, "internal-error")
 		return &PairDatabaseError{"failed to store main device identity", err}
 	}
+
+	canonicalOutcome := cli.handleCanonicalRegistration(ctx, pairSuccess, jid.Device)
+	cli.lastCanonicalReg.Store(&canonicalOutcome)
 
 	// Expect a disconnect after this and don't dispatch the usual Disconnected event
 	cli.expectDisconnect()
