@@ -392,6 +392,11 @@ func (evt *Message) UnwrapRaw() *Message {
 		evt.Message = evt.Message.GetBotInvokeMessage().GetMessage()
 		evt.IsBotInvoke = true
 	}
+	if evt.Message.GetGroupStatusMessageV2().GetMessage() != nil {
+		// Group status body (see MessageInfo.IsGroupStatus); WA Web unwraps the same field
+		// (WAWebDeviceSentMessageProtoUtils).
+		evt.Message = evt.Message.GetGroupStatusMessageV2().GetMessage()
+	}
 	if evt.Message.GetEphemeralMessage().GetMessage() != nil {
 		evt.Message = evt.Message.GetEphemeralMessage().GetMessage()
 		evt.IsEphemeral = true

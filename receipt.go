@@ -312,6 +312,11 @@ func buildBaseReceipt(id string, node *waBinary.Node) waBinary.Attrs {
 	if participant, ok := node.Attrs["participant"]; ok {
 		attrs["participant"] = participant
 	}
+	// Receipts for a group status carry class="status", like WA Web's
+	// (WAWebDeliveryReceiptClassUtils: isStatus() || isGroupStatus => "status").
+	if from, ok := node.Attrs["from"].(types.JID); ok && node.Tag == "status" && from.Server == types.GroupServer {
+		attrs["class"] = "status"
+	}
 	return attrs
 }
 

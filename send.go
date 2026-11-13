@@ -216,6 +216,12 @@ type SendRequestExtra struct {
 	StatusLIDAddressing bool
 
 	CheckPermissions bool
+
+	// GroupStatus posts the message as a group status (the status ring on a group) instead of a
+	// chat message. The recipient must be a group. The message should already be wrapped in
+	// GroupStatusMessageV2 with ContextInfo.IsGroupStatus and a GROUP_STATUS attribution, as the
+	// phone sends it; this flag adds <meta is_group_status="true"> to the group <message>.
+	GroupStatus bool
 }
 
 // ErrStatusMixedAddressing is returned when a LID-addressed status send is given a participant
@@ -312,6 +318,13 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	isBotMode := isInlineBotMode || to.IsBot()
 	needsMessageSecret := isBotMode || cli.shouldIncludeReportingToken(message)
 	var extraParams nodeExtraParams
+	if req.GroupStatus {
+		if to.Server != types.GroupServer {
+			err = fmt.Errorf("group status can only be sent to a group, got %s", to.Server)
+			return
+		}
+		extraParams.groupStatus = true
+	}
 
 	if needsMessageSecret {
 		if message.MessageContextInfo == nil {
@@ -463,6 +476,13 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			extraParams.metaNode.Attrs["thread_msg_id"] = req.Meta.ThreadMessageID
 			extraParams.metaNode.Attrs["thread_msg_sender_jid"] = req.Meta.ThreadMessageSenderJID
 		}
+	}
+
+	if extraParams.groupStatus {
+		// WA Web marks every send about a group status with <meta is_group_status="true">
+		// on a normal group <message> (WAWebSendMsgMetaNode); the server then delivers it to
+		// members as a <status> stanza. Sending <status to=group> directly is rejected (479).
+		extraParams.metaNode = groupStatusMetaNode(extraParams.metaNode)
 	}
 
 	if req.AdditionalNodes != nil {
@@ -885,6 +905,16 @@ func (cli *Client) sendNewsletter(
 	return data, nil
 }
 
+// groupStatusMetaNode marks a group send as a group status: <meta is_group_status="true">,
+// added to an existing meta node when there is one.
+func groupStatusMetaNode(meta *waBinary.Node) *waBinary.Node {
+	if meta == nil {
+		meta = &waBinary.Node{Tag: "meta", Attrs: waBinary.Attrs{}}
+	}
+	meta.Attrs["is_group_status"] = "true"
+	return meta
+}
+
 type nodeExtraParams struct {
 	botNode         *waBinary.Node
 	metaNode        *waBinary.Node
@@ -892,6 +922,7 @@ type nodeExtraParams struct {
 	addressingMode  types.AddressingMode
 	excludeDevices  []types.JID
 	peerRecipientPN types.JID
+	groupStatus     bool
 	// statusWebShape builds a status@broadcast stanza the way WhatsApp Web does (captured
 	// 2026-11-06, WA Web 2.3000.1052630229): the root tag is <status>, not <message>, and the
 	// sending device is left out of <participants> (our other devices stay, so the status still
@@ -1093,6 +1124,8 @@ func getTypeFromMessage(msg *waE2E.Message) string {
 		return getTypeFromMessage(msg.EphemeralMessage.Message)
 	case msg.DocumentWithCaptionMessage != nil:
 		return getTypeFromMessage(msg.DocumentWithCaptionMessage.Message)
+	case msg.GroupStatusMessageV2 != nil:
+		return getTypeFromMessage(msg.GroupStatusMessageV2.Message)
 	case msg.ReactionMessage != nil, msg.EncReactionMessage != nil:
 		return "reaction"
 	case msg.PollCreationMessage != nil, msg.PollUpdateMessage != nil:
@@ -1158,6 +1191,8 @@ func getMediaTypeFromMessage(msg *waE2E.Message) string {
 		return getMediaTypeFromMessage(msg.EphemeralMessage.Message)
 	case msg.DocumentWithCaptionMessage != nil:
 		return getMediaTypeFromMessage(msg.DocumentWithCaptionMessage.Message)
+	case msg.GroupStatusMessageV2 != nil:
+		return getMediaTypeFromMessage(msg.GroupStatusMessageV2.Message)
 	case msg.ExtendedTextMessage != nil && msg.ExtendedTextMessage.Title != nil:
 		return "url"
 	case msg.ImageMessage != nil:

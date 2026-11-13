@@ -401,7 +401,7 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 	var content []waBinary.Node
 	if msg.wa != nil {
 		content = cli.getMessageContent(
-			*encrypted, msg.wa, attrs, includeDeviceIdentity, nodeExtraParams{},
+			*encrypted, msg.wa, attrs, includeDeviceIdentity, retryExtraParams(msg.wa),
 		)
 	} else {
 		content = []waBinary.Node{
@@ -425,6 +425,18 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 	}
 	cli.Log.Debugf("Sent retry #%d for %s/%s to %s", retryCount, receipt.Chat, messageID, receipt.Sender)
 	return nil
+}
+
+// retryExtraParams rebuilds the send-time extras a resend needs from the stored message.
+// A group status keeps its <meta is_group_status="true">: without it the resend lands as a
+// chat message in the group instead of in the group's status ring (WAWebResendGroupMsg
+// keeps isGroupStatus on resends too).
+func retryExtraParams(msg *waE2E.Message) nodeExtraParams {
+	var params nodeExtraParams
+	if msg.GetGroupStatusMessageV2() != nil {
+		params.metaNode = groupStatusMetaNode(nil)
+	}
+	return params
 }
 
 func (cli *Client) cancelDelayedRequestFromPhone(msgID types.MessageID) {

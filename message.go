@@ -49,6 +49,10 @@ func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.No
 		cli.sendAck(ctx, node, NackParsingError)
 		return
 	}
+	cli.handleDecryptableMessageInfo(ctx, info, node)
+}
+
+func (cli *Client) handleDecryptableMessageInfo(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) {
 	if !info.SenderAlt.IsEmpty() {
 		cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
 	} else if !info.RecipientAlt.IsEmpty() {
@@ -74,6 +78,15 @@ func (cli *Client) handleUnencryptedMessage(ctx context.Context, node *waBinary.
 	if err != nil {
 		cli.Log.Warnf("Failed to parse message: %v", err)
 		cli.sendAck(ctx, node, NackParsingError)
+		return
+	}
+	if info.Chat.Server == types.GroupServer {
+		// A group status (the status ring on a group) arrives as a top-level <status> stanza
+		// from the group, encrypted with the group's sender key like a normal group message.
+		// WA Web classifies it the same way (WAWebCommsClassifyStatusStanza: from mixin
+		// "FromGroup" => isGroupStatus). Decrypt it through the normal path instead of dropping it.
+		info.IsGroupStatus = true
+		cli.handleDecryptableMessageInfo(ctx, info, node)
 		return
 	}
 	if info.Sender.Server != types.NewsletterServer {
@@ -265,6 +278,14 @@ func (cli *Client) parseMessageInfo(node *waBinary.Node) (*types.MessageInfo, er
 				cli.Log.Warnf("Failed to parse <bot> node in %s: %v", info.ID, err)
 			}
 		case "meta":
+			// A group status sent by one of our own devices (or any send about a group
+			// status) is a group <message> with <meta is_group_status="true">; only members
+			// receive it as a <status> stanza. Read the flag off this node directly:
+			// parseMsgMetaInfo looks for a <meta> child INSIDE the meta node (same upstream),
+			// so it never sees these attributes.
+			if child.AttrGetter().OptionalString("is_group_status") == "true" {
+				info.IsGroupStatus = true
+			}
 			info.MsgMetaInfo, err = cli.parseMsgMetaInfo(child)
 			if err != nil {
 				cli.Log.Warnf("Failed to parse <meta> node in %s: %v", info.ID, err)
