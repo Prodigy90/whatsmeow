@@ -47,7 +47,7 @@ func (cli *Client) handleStreamError(ctx context.Context, node *waBinary.Node) {
 		// user-initiated or server-side anti-abuse. Warn-level so it survives
 		// the production log filter.
 		cli.Log.Warnf("device_removed raw stanza: %s", node)
-		go cli.dispatchEvent(&events.LoggedOut{OnConnect: false, Reason: events.ConnectFailureLoggedOut})
+		go cli.dispatchEvent(&events.LoggedOut{OnConnect: false, Reason: events.ConnectFailureLoggedOut, Raw: node})
 		err := cli.Store.Delete(ctx)
 		if err != nil {
 			cli.Log.Warnf("Failed to delete store after device_removed error: %v", err)
@@ -132,7 +132,7 @@ func (cli *Client) handleConnectFailure(ctx context.Context, node *waBinary.Node
 	}
 	if reason.IsLoggedOut() {
 		cli.Log.Infof("Got %s connect failure, sending LoggedOut event and deleting session", reason)
-		go cli.dispatchEvent(&events.LoggedOut{OnConnect: true, Reason: reason})
+		go cli.dispatchEvent(&events.LoggedOut{OnConnect: true, Reason: reason, Raw: node})
 		err := cli.Store.Delete(ctx)
 		if err != nil {
 			cli.Log.Warnf("Failed to delete store after %d failure: %v", int(reason), err)
@@ -142,6 +142,7 @@ func (cli *Client) handleConnectFailure(ctx context.Context, node *waBinary.Node
 		go cli.dispatchEvent(&events.TemporaryBan{
 			Code:   events.TempBanReason(ag.Int("code")),
 			Expire: time.Duration(ag.Int("expire")) * time.Second,
+			Raw:    node,
 		})
 	} else if reason == events.ConnectFailureClientOutdated {
 		cli.Log.Errorf("Client outdated (405) connect failure (client version: %s)", store.GetWAVersion().String())
