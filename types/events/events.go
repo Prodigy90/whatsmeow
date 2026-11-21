@@ -143,6 +143,10 @@ type LoggedOut struct {
 	OnConnect bool
 	// If OnConnect is true, then this field contains the reason code.
 	Reason ConnectFailureReason
+	// Raw is the <failure> or <stream:error> node that caused the logout.
+	// WASBOT: kept so the caller can store what the server actually said (a 403
+	// can carry logout_message_header/subtext; a <conflict> can carry a reason).
+	Raw *waBinary.Node
 }
 
 // StreamReplaced is emitted when the client is disconnected by another client connecting with the same keys.
@@ -186,6 +190,8 @@ func (tbr TempBanReason) String() string {
 type TemporaryBan struct {
 	Code   TempBanReason
 	Expire time.Duration
+	// Raw is the <failure> node the ban arrived in (WASBOT).
+	Raw *waBinary.Node
 }
 
 func (tb *TemporaryBan) String() string {
