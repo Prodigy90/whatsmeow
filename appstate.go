@@ -146,9 +146,11 @@ func (cli *Client) handleAppStateRecovery(
 	if err != nil {
 		cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
 		return true
-	} else if currentVersion >= version {
+	} else if _, drifted := cli.driftedAppState.Load(name); !shouldApplyRecovery(currentVersion, version, drifted) {
 		cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than or equal to recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
 		return true
+	} else if currentVersion == version {
+		cli.Log.Infof("Applying app state recovery response for %s at the current version %d: the local %s hash drifted (tolerated LTHash mismatch)", reqID, version, name)
 	}
 	cli.Log.Debugf("Handling app state recovery response for %s", reqID)
 	mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
@@ -156,6 +158,8 @@ func (cli *Client) handleAppStateRecovery(
 		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
 		return true
 	}
+	// The snapshot replaced the collection, its hash included, so it is no longer drifted.
+	cli.driftedAppState.Delete(name)
 	err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
 	if err != nil {
 		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
@@ -171,6 +175,20 @@ func (cli *Client) handleAppStateRecovery(
 	}
 	cli.Log.Debugf("Finished handling app state recovery response for %s (%s to v%d)", reqID, name, version)
 	return true
+}
+
+// shouldApplyRecovery decides whether a primary-device recovery snapshot replaces
+// the local collection. A newer snapshot always does. One at the same version does
+// only when the collection is known to have drifted: since upstream #1319 tolerates
+// a mismatching LTHash when the patch MAC is valid, a drifted collection keeps
+// applying patches and its version keeps pace with the server's, so a repair
+// snapshot arrives at the same version, and refusing it would leave the hash wrong
+// for good. An older snapshot never does: it would roll the collection back.
+func shouldApplyRecovery(currentVersion, recoveryVersion uint64, drifted bool) bool {
+	if recoveryVersion > currentVersion {
+		return true
+	}
+	return drifted && recoveryVersion == currentVersion
 }
 
 func (cli *Client) applyAppStatePatches(

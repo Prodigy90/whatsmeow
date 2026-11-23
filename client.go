@@ -108,7 +108,11 @@ type Client struct {
 	pendingPhoneRerequests     map[types.MessageID]context.CancelFunc
 	pendingPhoneRerequestsLock sync.RWMutex
 
-	appStateProc     *appstate.Processor
+	appStateProc *appstate.Processor
+	// driftedAppState holds the collections whose local LTHash is known to have
+	// drifted (a patch was accepted under the tolerated-mismatch rule) and not yet
+	// been replaced by a recovery snapshot. See shouldApplyRecovery.
+	driftedAppState  sync.Map
 	appStateSyncLock sync.Mutex
 	// appStateSendLock serialises SendAppState. Concurrent sends to one collection
 	// encode against the same base version and race each other's conflict handling.
@@ -361,6 +365,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 	}
 	cli.paired.Store(deviceStore.ID != nil)
 	cli.appStateProc.OnLTHashTolerated = func(name appstate.WAPatchName, version uint64) {
+		cli.driftedAppState.Store(name, struct{}{})
 		cli.dispatchEvent(&events.AppStateLTHashTolerated{Name: name, Version: version})
 	}
 	cli.nodeHandlers = map[string]nodeHandler{
