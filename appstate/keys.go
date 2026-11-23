@@ -157,6 +157,15 @@ type Processor struct {
 	keyCacheLock sync.Mutex
 	Store        *store.Device
 	Log          waLog.Logger
+
+	// OnLTHashTolerated, if set, is called when a patch is accepted despite a
+	// mismatching LTHash because its patch MAC is valid (upstream #1319, the
+	// WhatsApp Web tolerance). The patch applies, but the local hash for that
+	// collection has drifted from the server's and stays drifted, and nothing
+	// returns an error any more, so this is the only signal a caller gets that
+	// the collection needs repair. It runs synchronously inside decoding: it
+	// must not block.
+	OnLTHashTolerated func(name WAPatchName, version uint64)
 }
 
 func NewProcessor(store *store.Device, log waLog.Logger) *Processor {

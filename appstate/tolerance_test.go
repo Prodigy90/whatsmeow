@@ -118,3 +118,57 @@ func TestValidatePatchToleranceRequiresPatchMAC(t *testing.T) {
 		t.Fatalf("expected ErrMismatchingPatchMAC, got %v", err)
 	}
 }
+
+// The tolerance swallows what used to be an ErrMismatchingLTHash error, and that
+// error was the only thing that told a caller the collection had drifted and
+// needed repair. OnLTHashTolerated replaces it: it must fire exactly when the
+// tolerance accepts a mismatching patch, and never for a patch that verified
+// cleanly or one that was refused.
+func TestValidatePatchToleranceReportsDrift(t *testing.T) {
+	type call struct {
+		name    WAPatchName
+		version uint64
+	}
+	record := func(proc *Processor) *[]call {
+		var calls []call
+		proc.OnLTHashTolerated = func(name WAPatchName, version uint64) {
+			calls = append(calls, call{name, version})
+		}
+		return &calls
+	}
+
+	t.Run("tolerated", func(t *testing.T) {
+		proc, _, keyB, _, before := rotatedKeyFixture(t, true)
+		calls := record(proc)
+		newL := encryptSet(t, keyB, indexL, markRead(2))
+		if _, err := decodeOne(proc, patchOf(11, phoneHash([]byte("drifted")), keyB, newL), before); err != nil {
+			t.Fatalf("DecodePatches: %v", err)
+		}
+		if len(*calls) != 1 || (*calls)[0] != (call{WAPatchRegularLow, 11}) {
+			t.Fatalf("OnLTHashTolerated calls = %+v, want one for regular_low v11", *calls)
+		}
+	})
+	t.Run("clean patch", func(t *testing.T) {
+		proc, _, keyB, oldL, before := rotatedKeyFixture(t, true)
+		calls := record(proc)
+		newL := encryptSet(t, keyB, indexL, markRead(2))
+		legacyHash := phoneHash(valueMACOf(oldL), valueMACOf(newL))
+		if _, err := decodeOne(proc, patchOf(11, legacyHash, keyB, newL), before); err != nil {
+			t.Fatalf("DecodePatches: %v", err)
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("OnLTHashTolerated fired for a patch that verified: %+v", *calls)
+		}
+	})
+	t.Run("refused patch", func(t *testing.T) {
+		proc, _, keyB, _, before := rotatedKeyFixture(t, true)
+		calls := record(proc)
+		newL := encryptSet(t, keyB, indexL, markRead(2))
+		if _, err := decodeOne(proc, patchOf(12, phoneHash([]byte("drifted")), keyB, newL), before); !errors.Is(err, ErrMismatchingLTHash) {
+			t.Fatalf("expected ErrMismatchingLTHash, got %v", err)
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("OnLTHashTolerated fired for a refused patch: %+v", *calls)
+		}
+	})
+}

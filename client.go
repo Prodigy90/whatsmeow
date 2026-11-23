@@ -360,6 +360,9 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		WebSocketHeaders: http.Header{},
 	}
 	cli.paired.Store(deviceStore.ID != nil)
+	cli.appStateProc.OnLTHashTolerated = func(name appstate.WAPatchName, version uint64) {
+		cli.dispatchEvent(&events.AppStateLTHashTolerated{Name: name, Version: version})
+	}
 	cli.nodeHandlers = map[string]nodeHandler{
 		"message":      cli.handleEncryptedMessage,
 		"status":       cli.handleUnencryptedMessage, // upstream: handleEncryptedMessage; kept on purpose, see handleUnencryptedMessage

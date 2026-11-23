@@ -578,6 +578,9 @@ func (proc *Processor) validatePatch(
 		}
 		if ltHashMismatch {
 			proc.Log.Warnf("Ignoring mismatching LTHash in %s v%d as patch MAC is valid (warnings: %+v)", patchName, version, warn)
+			if proc.OnLTHashTolerated != nil {
+				proc.OnLTHashTolerated(patchName, version)
+			}
 		}
 	}
 	return

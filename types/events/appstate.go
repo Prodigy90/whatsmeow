@@ -189,6 +189,18 @@ type AppStateSyncComplete struct {
 	Recovery bool
 }
 
+// AppStateLTHashTolerated is emitted when an app state patch was accepted even
+// though the collection's LTHash did not match, because the patch MAC was valid
+// and local state looked intact (the WhatsApp Web tolerance, upstream #1319).
+// The patch was applied, but the local hash for the collection has drifted from
+// the server's and stays drifted. Before the tolerance this case surfaced as an
+// AppStateSyncError wrapping appstate.ErrMismatchingLTHash; callers that repaired
+// a collection on that error should treat this event the same way.
+type AppStateLTHashTolerated struct {
+	Name    appstate.WAPatchName
+	Version uint64
+}
+
 type AppStateSyncError struct {
 	Name     appstate.WAPatchName
 	Error    error
