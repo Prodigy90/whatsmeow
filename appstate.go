@@ -118,6 +118,12 @@ func (cli *Client) SetTolerateLTHashMismatch(enabled bool) {
 	cli.appStateProc.SetTolerateLTHashMismatch(enabled)
 }
 
+// TolerateLTHashMismatch reports whether SetTolerateLTHashMismatch turned the
+// tolerance on.
+func (cli *Client) TolerateLTHashMismatch() bool {
+	return cli.appStateProc.TolerateLTHashMismatch()
+}
+
 func (cli *Client) handleAppStateRecovery(
 	ctx context.Context,
 	reqID types.MessageID,

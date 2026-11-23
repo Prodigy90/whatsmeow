@@ -37,15 +37,15 @@ func TestShouldApplyRecovery(t *testing.T) {
 // and SetTolerateLTHashMismatch is what reaches the processor that decodes patches.
 func TestClientLTHashToleranceDefaultsOff(t *testing.T) {
 	cli, _, _ := statusRoutingClient(t)
-	if cli.appStateProc.TolerateLTHashMismatch() {
+	if cli.TolerateLTHashMismatch() {
 		t.Fatal("a new client tolerates LTHash mismatches; the fork default must be off")
 	}
 	cli.SetTolerateLTHashMismatch(true)
-	if !cli.appStateProc.TolerateLTHashMismatch() {
+	if !cli.TolerateLTHashMismatch() {
 		t.Fatal("SetTolerateLTHashMismatch(true) did not reach the app state processor")
 	}
 	cli.SetTolerateLTHashMismatch(false)
-	if cli.appStateProc.TolerateLTHashMismatch() {
+	if cli.TolerateLTHashMismatch() {
 		t.Fatal("SetTolerateLTHashMismatch(false) did not turn the tolerance back off")
 	}
 }
