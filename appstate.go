@@ -107,6 +107,17 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	return eventsToDispatch, nil
 }
 
+// SetTolerateLTHashMismatch turns on upstream #1319's LTHash tolerance (WhatsApp
+// Web's behaviour): a patch whose LTHash mismatches is applied when its patch MAC is
+// valid, the version is consecutive and the local hash is not empty, and the client
+// dispatches events.AppStateLTHashTolerated so the caller can request repair. Off by
+// default in this fork: such a patch fails with appstate.ErrMismatchingLTHash and
+// surfaces as events.AppStateSyncError, as before #1319. Set it after NewClient and
+// before Connect.
+func (cli *Client) SetTolerateLTHashMismatch(enabled bool) {
+	cli.appStateProc.SetTolerateLTHashMismatch(enabled)
+}
+
 func (cli *Client) handleAppStateRecovery(
 	ctx context.Context,
 	reqID types.MessageID,

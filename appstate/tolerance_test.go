@@ -21,10 +21,12 @@ import (
 
 // rotatedKeyFixture seeds v10 with one record for indexL under keyA. A SET of
 // indexL under keyB then has a collapse plan (it supersedes a record written
-// under another key), so the legacy retry is reachable.
+// under another key), so the legacy retry is reachable. The tolerance is turned on
+// (the fork's default is off; TestValidatePatchToleranceOffByDefault covers that).
 func rotatedKeyFixture(t *testing.T, seedHash bool) (*Processor, *memAppState, testKey, *waServerSync.SyncdMutation, HashState) {
 	t.Helper()
 	proc, mem := newTestProcessor(t)
+	proc.SetTolerateLTHashMismatch(true)
 	keyA, keyB := addTestKey(t, mem, 1), addTestKey(t, mem, 2)
 	oldL := encryptSet(t, keyA, indexL, markRead(1))
 	before := HashState{Version: 10}
@@ -171,4 +173,50 @@ func TestValidatePatchToleranceReportsDrift(t *testing.T) {
 			t.Fatalf("OnLTHashTolerated fired for a refused patch: %+v", *calls)
 		}
 	})
+}
+
+// The tolerance is off unless the client opts in, and off means pre-#1319: a patch
+// the tolerance would accept fails with ErrMismatchingLTHash (after the legacy retry
+// has had its turn), nothing is stored for it, and OnLTHashTolerated never fires.
+func TestValidatePatchToleranceOffByDefault(t *testing.T) {
+	unrelated := phoneHash([]byte("drifted state the server signed over"))
+	for _, tc := range []struct {
+		name  string
+		setup func(*Processor)
+	}{
+		{"never enabled", func(proc *Processor) {}},
+		{"enabled then disabled", func(proc *Processor) {
+			proc.SetTolerateLTHashMismatch(true)
+			proc.SetTolerateLTHashMismatch(false)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proc, mem := newTestProcessor(t)
+			tc.setup(proc)
+			keyA, keyB := addTestKey(t, mem, 1), addTestKey(t, mem, 2)
+			oldL := encryptSet(t, keyA, indexL, markRead(1))
+			before := HashState{Version: 10, Hash: phoneHash(valueMACOf(oldL))}
+			seedState(t, mem, before.Version, before.Hash, true, oldL)
+			fired := 0
+			proc.OnLTHashTolerated = func(WAPatchName, uint64) { fired++ }
+
+			newL := encryptSet(t, keyB, indexL, markRead(2))
+			_, err := decodeOne(proc, patchOf(11, unrelated, keyB, newL), before)
+			if !errors.Is(err, ErrMismatchingLTHash) {
+				t.Fatalf("expected ErrMismatchingLTHash with the tolerance off, got %v", err)
+			}
+			if fired != 0 {
+				t.Fatalf("OnLTHashTolerated fired %d times with the tolerance off", fired)
+			}
+			if mem.has(string(WAPatchRegularLow), indexMACOf(newL)) {
+				t.Error("the refused patch's record was stored")
+			}
+
+			// The legacy retry is not part of the tolerance and still runs with it off.
+			legacyHash := phoneHash(valueMACOf(oldL), valueMACOf(newL))
+			if _, err := decodeOne(proc, patchOf(11, legacyHash, keyB, newL), before); err != nil {
+				t.Fatalf("legacy-rule patch with the tolerance off: %v", err)
+			}
+		})
+	}
 }

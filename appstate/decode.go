@@ -558,11 +558,13 @@ func (proc *Processor) validatePatch(
 			}
 		}
 		// If the patch still doesn't verify with either subtraction rule, fall back to
-		// WhatsApp Web's tolerance (upstream #1319): accept it when the patch MAC is
-		// valid and local state isn't obviously missing. newState then keeps the
-		// every-record subtraction, which is the rule WhatsApp Web itself applies.
+		// WhatsApp Web's tolerance (upstream #1319), if the client enabled it: accept
+		// it when the patch MAC is valid and local state isn't obviously missing.
+		// newState then keeps the every-record subtraction, which is the rule WhatsApp
+		// Web itself applies. With the tolerance off (the default in this fork), a
+		// mismatch fails here exactly as it did before #1319.
 		ltHashMismatch := errors.Is(err, ErrMismatchingLTHash)
-		if err != nil && !ltHashMismatch {
+		if err != nil && (!ltHashMismatch || !proc.tolerateLTHashMismatch.Load()) {
 			return
 		}
 		// Like WhatsApp Web, only ignore the mismatch if local state isn't obviously missing.
