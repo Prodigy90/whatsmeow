@@ -187,8 +187,8 @@ func (int *DangerousInternalClient) GetUnifiedSessionID() string {
 	return int.c.getUnifiedSessionID()
 }
 
-func (int *DangerousInternalClient) SendUnifiedSession() {
-	int.c.sendUnifiedSession()
+func (int *DangerousInternalClient) SendUnifiedSession(checkLastSend bool) {
+	int.c.sendUnifiedSession(checkLastSend)
 }
 
 func (int *DangerousInternalClient) HandleStreamError(ctx context.Context, node *waBinary.Node) {
@@ -301,6 +301,10 @@ func (int *DangerousInternalClient) KeepAliveLoop(ctx, connCtx context.Context) 
 
 func (int *DangerousInternalClient) SendKeepAlive(ctx context.Context) (isSuccess, shouldContinue bool) {
 	return int.c.sendKeepAlive(ctx)
+}
+
+func (int *DangerousInternalClient) IsKeepAliveNode(node *waBinary.Node) bool {
+	return int.c.isKeepAliveNode(node)
 }
 
 func (int *DangerousInternalClient) RefreshMediaConn(ctx context.Context, force bool) (*MediaConn, error) {
@@ -447,8 +451,8 @@ func (int *DangerousInternalClient) HandleEncryptNotification(ctx context.Contex
 	int.c.handleEncryptNotification(ctx, node)
 }
 
-func (int *DangerousInternalClient) HandleAppStateNotification(ctx context.Context, node *waBinary.Node) {
-	int.c.handleAppStateNotification(ctx, node)
+func (int *DangerousInternalClient) HandleAppStateNotification(ctx context.Context, node *waBinary.Node) bool {
+	return int.c.handleAppStateNotification(ctx, node)
 }
 
 func (int *DangerousInternalClient) HandlePictureNotification(ctx context.Context, node *waBinary.Node) {
@@ -457,6 +461,10 @@ func (int *DangerousInternalClient) HandlePictureNotification(ctx context.Contex
 
 func (int *DangerousInternalClient) HandleDeviceNotification(ctx context.Context, node *waBinary.Node) {
 	int.c.handleDeviceNotification(ctx, node)
+}
+
+func (int *DangerousInternalClient) HandleFBCallNotification(ctx context.Context, node *waBinary.Node) bool {
+	return int.c.handleFBCallNotification(ctx, node)
 }
 
 func (int *DangerousInternalClient) HandleFBDeviceNotification(ctx context.Context, node *waBinary.Node) {
