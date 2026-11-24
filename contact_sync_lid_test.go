@@ -9,6 +9,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 type nopContactStore struct{ store.ContactStore }
@@ -90,5 +91,45 @@ func TestContactSyncLID_OtherCollectionsIgnored(t *testing.T) {
 	_ = cli.collectEventsToDispatch(context.Background(), appstate.WAPatchRegular, contactSyncFixture()[:1], false, nil)
 	if len(rec.pairs()) != 0 {
 		t.Fatalf("stored mappings from a non-contact collection: %v", rec.pairs())
+	}
+}
+
+type recordingContactStore struct {
+	store.ContactStore
+	puts []string
+}
+
+func (r *recordingContactStore) PutAllContactNames(context.Context, []store.ContactEntry) error {
+	return nil
+}
+func (r *recordingContactStore) PutContactName(_ context.Context, jid types.JID, _, full string) error {
+	r.puts = append(r.puts, jid.User+"="+full)
+	return nil
+}
+
+// Upstream #1309 blanks the stored name on a contact remove. Off by default, a
+// remove changes nothing and dispatches nothing (pre-#1309); turned on, it blanks
+// the name and dispatches events.Contact with a nil Action.
+func TestContactRemove_GatedBySwitch(t *testing.T) {
+	remove := contactMutation(waServerSync.SyncdMutation_REMOVE, "2348066666666@s.whatsapp.net", "Gone", "")
+	for _, on := range []bool{false, true} {
+		cli, _ := testClient(t)
+		rec := &recordingContactStore{}
+		cli.Store.Contacts = rec
+		cli.SetHandleContactRemovals(on)
+		evt := cli.dispatchAppState(context.Background(), appstate.WAPatchCriticalUnblockLow, remove, false)
+		if !on {
+			if evt != nil || len(rec.puts) != 0 {
+				t.Fatalf("switch off: remove dispatched %v and wrote %v", evt, rec.puts)
+			}
+			continue
+		}
+		c, ok := evt.(*events.Contact)
+		if !ok || c.Action != nil {
+			t.Fatalf("switch on: want events.Contact with nil Action, got %#v", evt)
+		}
+		if len(rec.puts) != 1 || rec.puts[0] != "2348066666666=" {
+			t.Fatalf("switch on: want the name blanked, got %v", rec.puts)
+		}
 	}
 }

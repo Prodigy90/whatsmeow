@@ -115,6 +115,9 @@ type MessageInfo struct {
 	// IsGroupStatus is set for a status posted to a group (the status ring on a group),
 	// which arrives as a <status> stanza from the group instead of a <message>.
 	IsGroupStatus bool
+	// StanzaTag is the tag of the node the message arrived in: message for normal messages, status for
+	// newsletter and group statuses, appdata for some other things.
+	StanzaTag string
 
 	VerifiedName   *VerifiedName
 	DeviceSentMeta *DeviceSentMeta // Metadata for direct messages sent from another one of the user's own devices.

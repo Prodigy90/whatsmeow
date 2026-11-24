@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/base64"
 	"sync"
+	"sync/atomic"
 
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/util/hkdfutil"
@@ -134,6 +135,8 @@ const (
 	IndexBizAISettingsNudgeAction                     = "biz_ai_settings_nudge"
 	IndexWasaRootSecretAction                         = "wasa_root_secret"
 	IndexSharedDeviceAllowlist                        = "shared_device_allowlist"
+	IndexSharedDeviceSecret                           = "shared_device_secret"
+	IndexHatchCVMSecret                               = "hatch_cvm_secret"
 )
 
 // Constants for the critical_unblock_low app state indexes.
@@ -155,6 +158,34 @@ type Processor struct {
 	keyCacheLock sync.Mutex
 	Store        *store.Device
 	Log          waLog.Logger
+
+	// OnLTHashTolerated, if set, is called when a patch is accepted despite a
+	// mismatching LTHash because its patch MAC is valid (upstream #1319, the
+	// WhatsApp Web tolerance). The patch applies, but the local hash for that
+	// collection has drifted from the server's and stays drifted, and nothing
+	// returns an error any more, so this is the only signal a caller gets that
+	// the collection needs repair. It runs synchronously inside decoding: it
+	// must not block. Only fires while SetTolerateLTHashMismatch(true) is in force.
+	OnLTHashTolerated func(name WAPatchName, version uint64)
+
+	// tolerateLTHashMismatch turns on upstream #1319's tolerance. Off by default in
+	// this fork, so a mismatching LTHash fails with ErrMismatchingLTHash as it did
+	// before #1319 until a caller opts in. Atomic because decoding reads it on the
+	// app state sync goroutines.
+	tolerateLTHashMismatch atomic.Bool
+}
+
+// SetTolerateLTHashMismatch turns upstream #1319's tolerance on or off. When on, a
+// patch whose LTHash mismatches is accepted if its patch MAC is valid, the version is
+// consecutive and the local hash is not empty, and OnLTHashTolerated reports it. When
+// off (the default), that patch fails with ErrMismatchingLTHash.
+func (proc *Processor) SetTolerateLTHashMismatch(enabled bool) {
+	proc.tolerateLTHashMismatch.Store(enabled)
+}
+
+// TolerateLTHashMismatch reports whether upstream #1319's tolerance is on.
+func (proc *Processor) TolerateLTHashMismatch() bool {
+	return proc.tolerateLTHashMismatch.Load()
 }
 
 func NewProcessor(store *store.Device, log waLog.Logger) *Processor {

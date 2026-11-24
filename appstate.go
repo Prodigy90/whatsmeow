@@ -45,6 +45,9 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
+	if until := cli.appStateBackoff[name]; time.Now().Before(until) {
+		return nil, fmt.Errorf("%w: not fetching %s until %s", ErrAppStateRateLimited, name, until.Format(time.RFC3339))
+	}
 	if fullSync {
 		err := cli.Store.AppState.DeleteAppStateVersion(ctx, string(name))
 		if err != nil {
@@ -72,6 +75,12 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	for hasMore {
 		patches, err := cli.fetchAppStatePatches(ctx, name, state.Version, wantSnapshot)
+		var iqErr *IQError
+		if errors.As(err, &iqErr) && iqErr.Code == 429 && iqErr.ErrorNode != nil {
+			if backoff := iqErr.ErrorNode.AttrGetter().OptionalInt("backoff"); backoff > 0 {
+				cli.appStateBackoff[name] = time.Now().Add(time.Duration(backoff) * time.Second)
+			}
+		}
 		if err != nil {
 			if fullSync && ctx.Err() == nil && cli.BackgroundEventCtx.Err() == nil {
 				cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
@@ -96,6 +105,36 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 		cli.Log.Debugf("Synced app state %s from version %d to %d", name, version, state.Version)
 	}
 	return eventsToDispatch, nil
+}
+
+// SetTolerateLTHashMismatch turns on upstream #1319's LTHash tolerance (WhatsApp
+// Web's behaviour): a patch whose LTHash mismatches is applied when its patch MAC is
+// valid, the version is consecutive and the local hash is not empty, and the client
+// dispatches events.AppStateLTHashTolerated so the caller can request repair. Off by
+// default in this fork: such a patch fails with appstate.ErrMismatchingLTHash and
+// surfaces as events.AppStateSyncError, as before #1319. Set it after NewClient and
+// before Connect.
+func (cli *Client) SetTolerateLTHashMismatch(enabled bool) {
+	cli.appStateProc.SetTolerateLTHashMismatch(enabled)
+}
+
+// SetHandleContactRemovals turns on upstream #1309's handling of contact removes:
+// the stored name is blanked and events.Contact is dispatched with a nil Action.
+// Off by default: a remove is ignored, as before #1309, so callers that treat a
+// nameless stored contact as "never named" don't mistake a phone delete for it.
+func (cli *Client) SetHandleContactRemovals(enabled bool) {
+	cli.handleContactRemovals.Store(enabled)
+}
+
+// HandleContactRemovals reports whether SetHandleContactRemovals turned it on.
+func (cli *Client) HandleContactRemovals() bool {
+	return cli.handleContactRemovals.Load()
+}
+
+// TolerateLTHashMismatch reports whether SetTolerateLTHashMismatch turned the
+// tolerance on.
+func (cli *Client) TolerateLTHashMismatch() bool {
+	return cli.appStateProc.TolerateLTHashMismatch()
 }
 
 func (cli *Client) handleAppStateRecovery(
@@ -137,9 +176,11 @@ func (cli *Client) handleAppStateRecovery(
 	if err != nil {
 		cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
 		return true
-	} else if currentVersion >= version {
+	} else if _, drifted := cli.driftedAppState.Load(name); !shouldApplyRecovery(currentVersion, version, drifted) {
 		cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than or equal to recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
 		return true
+	} else if currentVersion == version {
+		cli.Log.Infof("Applying app state recovery response for %s at the current version %d: the local %s hash drifted (tolerated LTHash mismatch)", reqID, version, name)
 	}
 	cli.Log.Debugf("Handling app state recovery response for %s", reqID)
 	mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
@@ -147,6 +188,8 @@ func (cli *Client) handleAppStateRecovery(
 		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
 		return true
 	}
+	// The snapshot replaced the collection, its hash included, so it is no longer drifted.
+	cli.driftedAppState.Delete(name)
 	err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
 	if err != nil {
 		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
@@ -162,6 +205,20 @@ func (cli *Client) handleAppStateRecovery(
 	}
 	cli.Log.Debugf("Finished handling app state recovery response for %s (%s to v%d)", reqID, name, version)
 	return true
+}
+
+// shouldApplyRecovery decides whether a primary-device recovery snapshot replaces
+// the local collection. A newer snapshot always does. One at the same version does
+// only when the collection is known to have drifted: since upstream #1319 tolerates
+// a mismatching LTHash when the patch MAC is valid, a drifted collection keeps
+// applying patches and its version keeps pace with the server's, so a repair
+// snapshot arrives at the same version, and refusing it would leave the hash wrong
+// for good. An older snapshot never does: it would roll the collection back.
+func shouldApplyRecovery(currentVersion, recoveryVersion uint64, drifted bool) bool {
+	if recoveryVersion > currentVersion {
+		return true
+	}
+	return drifted && recoveryVersion == currentVersion
 }
 
 func (cli *Client) applyAppStatePatches(
@@ -267,7 +324,9 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		return
 	}
 
-	if mutation.Operation != waServerSync.SyncdMutation_SET {
+	isContactRemove := mutation.Operation == waServerSync.SyncdMutation_REMOVE && mutation.Index[0] == appstate.IndexContact &&
+		cli.handleContactRemovals.Load()
+	if mutation.Operation != waServerSync.SyncdMutation_SET && !isContactRemove {
 		return
 	}
 
@@ -307,6 +366,9 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		}
 	case appstate.IndexContact:
 		act := mutation.Action.GetContactAction()
+		if isContactRemove {
+			act = nil
+		}
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil {
 			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName())

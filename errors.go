@@ -35,7 +35,8 @@ var (
 
 	ErrNoPrivacyToken = errors.New("no privacy token stored")
 
-	ErrAppStateUpdate = errors.New("server returned error updating app state")
+	ErrAppStateUpdate      = errors.New("server returned error updating app state")
+	ErrAppStateRateLimited = errors.New("app state fetch is rate limited by the server")
 )
 
 // Errors that happen while confirming device pairing
@@ -114,8 +115,9 @@ var (
 	// ErrGroupSendDropped is returned (only when Client.GroupSendDropAsError is set) for a plain content
 	// group send (not a reaction, pin, edit, revoke or poll vote) the server acked with no error and no `count`: it accepted the message and delivered it to no one.
 	// In practice this is a non-admin sending into an announce-only (admins-only) group.
-	ErrGroupSendDropped    = errors.New("server accepted the group message but delivered it to no one")
-	ErrNoPermissionInGroup = errors.New("no permission to send that message in the group")
+	ErrGroupSendDropped       = errors.New("server accepted the group message but delivered it to no one")
+	ErrNoPermissionInGroup    = errors.New("no permission to send that message in the group")
+	ErrRecipientNotOnWhatsApp = errors.New("recipient is not on WhatsApp")
 )
 
 type DownloadHTTPError struct {
