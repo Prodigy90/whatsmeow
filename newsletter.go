@@ -118,15 +118,12 @@ const (
 	queryNewslettersDirectory      = "6190824427689257" // variables -> input -> {view: "RECOMMENDED", limit: 50, start_cursor: base64, filters: {country_codes: [string]}}
 	querySubscribedNewsletters     = "6388546374527196" // variables -> empty, output: xwa2_newsletter_subscribed
 	queryNewsletterSubscribers     = "9800646650009898" // variables -> input -> {newsletter_id, count}, output: xwa2_newsletter_subscribers -> subscribers -> edges
-	// variables -> {newsletter_id: "<id>@newsletter"}, output: xwa2_newsletter_admin -> capabilities ([string]).
-	// WAWebMexFetchNewsletterAdminCapabilitiesJob. Admin-only: a channel you only follow answers "Not Authorized".
-	queryNewsletterAdminCapabilities = "9801384413216421"
-	mutationMuteNewsletter           = "6274038279359549" // variables -> {newsletter_id, updates->{description, settings}}, output: xwa2_newsletter_update -> NewsletterMetadata without viewer meta
-	mutationUnmuteNewsletter         = "6068417879924485"
-	mutationUpdateNewsletter         = "7150902998257522"
-	mutationCreateNewsletter         = "6234210096708695"
-	mutationUnfollowNewsletter       = "6392786840836363"
-	mutationFollowNewsletter         = "9926858900719341"
+	mutationMuteNewsletter         = "6274038279359549" // variables -> {newsletter_id, updates->{description, settings}}, output: xwa2_newsletter_update -> NewsletterMetadata without viewer meta
+	mutationUnmuteNewsletter       = "6068417879924485"
+	mutationUpdateNewsletter       = "7150902998257522"
+	mutationCreateNewsletter       = "6234210096708695"
+	mutationUnfollowNewsletter     = "6392786840836363"
+	mutationFollowNewsletter       = "9926858900719341"
 
 	// desktop & mobile
 	queryFetchNewsletterDesktop        = "9779843322044422"
@@ -456,6 +453,11 @@ func (cli *Client) GetNewsletterMessageUpdates(ctx context.Context, jid types.JI
 	}
 	return cli.parseNewsletterMessages(&messages), nil
 }
+
+// queryNewsletterAdminCapabilities is WAWebMexFetchNewsletterAdminCapabilitiesJob: variables
+// {newsletter_id: "<id>@newsletter"}, output xwa2_newsletter_admin -> capabilities ([string]).
+// Admin-only: a channel you only follow answers "Not Authorized".
+const queryNewsletterAdminCapabilities = "9801384413216421"
 
 // NewsletterCapabilityChannelStatusProducer is the admin capability that lets a channel post
 // to its own status ring (WAWebCommonNewsletterEnums.NewsletterCapability 18). WhatsApp is
