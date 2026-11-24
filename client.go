@@ -109,6 +109,10 @@ type Client struct {
 	pendingPhoneRerequestsLock sync.RWMutex
 
 	appStateProc *appstate.Processor
+	// handleContactRemovals turns on upstream #1309: a contact REMOVE mutation
+	// blanks the stored name and dispatches events.Contact with a nil Action.
+	// Off by default, which keeps the pre-#1309 behaviour (removes ignored).
+	handleContactRemovals atomic.Bool
 	// driftedAppState holds the collections whose local LTHash is known to have
 	// drifted (a patch was accepted under the tolerated-mismatch rule) and not yet
 	// been replaced by a recovery snapshot. See shouldApplyRecovery.

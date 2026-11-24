@@ -118,6 +118,19 @@ func (cli *Client) SetTolerateLTHashMismatch(enabled bool) {
 	cli.appStateProc.SetTolerateLTHashMismatch(enabled)
 }
 
+// SetHandleContactRemovals turns on upstream #1309's handling of contact removes:
+// the stored name is blanked and events.Contact is dispatched with a nil Action.
+// Off by default: a remove is ignored, as before #1309, so callers that treat a
+// nameless stored contact as "never named" don't mistake a phone delete for it.
+func (cli *Client) SetHandleContactRemovals(enabled bool) {
+	cli.handleContactRemovals.Store(enabled)
+}
+
+// HandleContactRemovals reports whether SetHandleContactRemovals turned it on.
+func (cli *Client) HandleContactRemovals() bool {
+	return cli.handleContactRemovals.Load()
+}
+
 // TolerateLTHashMismatch reports whether SetTolerateLTHashMismatch turned the
 // tolerance on.
 func (cli *Client) TolerateLTHashMismatch() bool {
@@ -311,7 +324,8 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		return
 	}
 
-	isContactRemove := mutation.Operation == waServerSync.SyncdMutation_REMOVE && mutation.Index[0] == appstate.IndexContact
+	isContactRemove := mutation.Operation == waServerSync.SyncdMutation_REMOVE && mutation.Index[0] == appstate.IndexContact &&
+		cli.handleContactRemovals.Load()
 	if mutation.Operation != waServerSync.SyncdMutation_SET && !isContactRemove {
 		return
 	}
