@@ -715,8 +715,8 @@ func (int *DangerousInternalClient) SendRetryReceipt(ctx context.Context, node *
 	int.c.sendRetryReceipt(ctx, node, info, forceIncludeIdentity)
 }
 
-func (int *DangerousInternalClient) SendNewsletter(ctx context.Context, to types.JID, id types.MessageID, message *waE2E.Message, mediaID string, timings *MessageDebugTimings) ([]byte, error) {
-	return int.c.sendNewsletter(ctx, to, id, message, mediaID, timings)
+func (int *DangerousInternalClient) SendNewsletter(ctx context.Context, to types.JID, id types.MessageID, message *waE2E.Message, mediaID string, asStatus bool, timings *MessageDebugTimings) ([]byte, error) {
+	return int.c.sendNewsletter(ctx, to, id, message, mediaID, asStatus, timings)
 }
 
 func (int *DangerousInternalClient) SendGroup(ctx context.Context, ownID, to types.JID, participants []types.JID, id types.MessageID, message *waE2E.Message, timings *MessageDebugTimings, extraParams nodeExtraParams) (string, []byte, error) {

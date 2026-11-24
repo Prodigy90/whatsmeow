@@ -118,12 +118,15 @@ const (
 	queryNewslettersDirectory      = "6190824427689257" // variables -> input -> {view: "RECOMMENDED", limit: 50, start_cursor: base64, filters: {country_codes: [string]}}
 	querySubscribedNewsletters     = "6388546374527196" // variables -> empty, output: xwa2_newsletter_subscribed
 	queryNewsletterSubscribers     = "9800646650009898" // variables -> input -> {newsletter_id, count}, output: xwa2_newsletter_subscribers -> subscribers -> edges
-	mutationMuteNewsletter         = "6274038279359549" // variables -> {newsletter_id, updates->{description, settings}}, output: xwa2_newsletter_update -> NewsletterMetadata without viewer meta
-	mutationUnmuteNewsletter       = "6068417879924485"
-	mutationUpdateNewsletter       = "7150902998257522"
-	mutationCreateNewsletter       = "6234210096708695"
-	mutationUnfollowNewsletter     = "6392786840836363"
-	mutationFollowNewsletter       = "9926858900719341"
+	// variables -> {newsletter_id: "<id>@newsletter"}, output: xwa2_newsletter_admin -> capabilities ([string]).
+	// WAWebMexFetchNewsletterAdminCapabilitiesJob. Admin-only: a channel you only follow answers "Not Authorized".
+	queryNewsletterAdminCapabilities = "9801384413216421"
+	mutationMuteNewsletter           = "6274038279359549" // variables -> {newsletter_id, updates->{description, settings}}, output: xwa2_newsletter_update -> NewsletterMetadata without viewer meta
+	mutationUnmuteNewsletter         = "6068417879924485"
+	mutationUpdateNewsletter         = "7150902998257522"
+	mutationCreateNewsletter         = "6234210096708695"
+	mutationUnfollowNewsletter       = "6392786840836363"
+	mutationFollowNewsletter         = "9926858900719341"
 
 	// desktop & mobile
 	queryFetchNewsletterDesktop        = "9779843322044422"
@@ -452,4 +455,43 @@ func (cli *Client) GetNewsletterMessageUpdates(ctx context.Context, jid types.JI
 		return nil, &ElementMissingError{Tag: "messages", In: "newsletter messages response"}
 	}
 	return cli.parseNewsletterMessages(&messages), nil
+}
+
+// NewsletterCapabilityChannelStatusProducer is the admin capability that lets a channel post
+// to its own status ring (WAWebCommonNewsletterEnums.NewsletterCapability 18). WhatsApp is
+// rolling it out channel by channel.
+const NewsletterCapabilityChannelStatusProducer = "CHANNEL_STATUS_PRODUCER"
+
+type respNewsletterAdminCapabilities struct {
+	Admin *struct {
+		Capabilities []string `json:"capabilities"`
+	} `json:"xwa2_newsletter_admin"`
+}
+
+// GetNewsletterAdminCapabilities returns the capability names WhatsApp grants on a channel
+// you own or admin (e.g. NewsletterCapabilityChannelStatusProducer), the way WhatsApp Web's
+// WAWebMexFetchNewsletterAdminCapabilitiesJob reads them. Names WhatsApp adds later come
+// through as-is. A channel you only follow answers with a GraphQL error.
+func (cli *Client) GetNewsletterAdminCapabilities(ctx context.Context, jid types.JID) ([]string, error) {
+	if jid.Server != types.NewsletterServer {
+		return nil, fmt.Errorf("%s is not a newsletter JID", jid)
+	}
+	data, err := cli.sendMexIQ(ctx, queryNewsletterAdminCapabilities, map[string]any{
+		"newsletter_id": jid.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseNewsletterAdminCapabilities(data)
+}
+
+func parseNewsletterAdminCapabilities(data []byte) ([]string, error) {
+	var resp respNewsletterAdminCapabilities
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse newsletter admin capabilities: %w", err)
+	}
+	if resp.Admin == nil {
+		return nil, &ElementMissingError{Tag: "xwa2_newsletter_admin", In: "newsletter admin capabilities response"}
+	}
+	return resp.Admin.Capabilities, nil
 }
