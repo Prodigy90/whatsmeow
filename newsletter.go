@@ -453,3 +453,47 @@ func (cli *Client) GetNewsletterMessageUpdates(ctx context.Context, jid types.JI
 	}
 	return cli.parseNewsletterMessages(&messages), nil
 }
+
+// queryNewsletterAdminCapabilities is WAWebMexFetchNewsletterAdminCapabilitiesJob: variables
+// {newsletter_id: "<id>@newsletter"}, output xwa2_newsletter_admin -> capabilities ([string]).
+// Admin-only: a channel you only follow answers "Not Authorized".
+const queryNewsletterAdminCapabilities = "9801384413216421"
+
+// NewsletterCapabilityChannelStatusProducer is the admin capability that lets a channel post
+// to its own status ring (WAWebCommonNewsletterEnums.NewsletterCapability 18). WhatsApp is
+// rolling it out channel by channel.
+const NewsletterCapabilityChannelStatusProducer = "CHANNEL_STATUS_PRODUCER"
+
+type respNewsletterAdminCapabilities struct {
+	Admin *struct {
+		Capabilities []string `json:"capabilities"`
+	} `json:"xwa2_newsletter_admin"`
+}
+
+// GetNewsletterAdminCapabilities returns the capability names WhatsApp grants on a channel
+// you own or admin (e.g. NewsletterCapabilityChannelStatusProducer), the way WhatsApp Web's
+// WAWebMexFetchNewsletterAdminCapabilitiesJob reads them. Names WhatsApp adds later come
+// through as-is. A channel you only follow answers with a GraphQL error.
+func (cli *Client) GetNewsletterAdminCapabilities(ctx context.Context, jid types.JID) ([]string, error) {
+	if jid.Server != types.NewsletterServer {
+		return nil, fmt.Errorf("%s is not a newsletter JID", jid)
+	}
+	data, err := cli.sendMexIQ(ctx, queryNewsletterAdminCapabilities, map[string]any{
+		"newsletter_id": jid.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseNewsletterAdminCapabilities(data)
+}
+
+func parseNewsletterAdminCapabilities(data []byte) ([]string, error) {
+	var resp respNewsletterAdminCapabilities
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse newsletter admin capabilities: %w", err)
+	}
+	if resp.Admin == nil {
+		return nil, &ElementMissingError{Tag: "xwa2_newsletter_admin", In: "newsletter admin capabilities response"}
+	}
+	return resp.Admin.Capabilities, nil
+}

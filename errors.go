@@ -273,3 +273,7 @@ func (err *DisconnectedError) Is(other error) bool {
 	}
 	return otherDisc.Action == err.Action
 }
+
+// ErrNewsletterStatusMediaType is returned for a channel status (SendRequestExtra.NewsletterStatus)
+// carrying media other than an image or a video, which WhatsApp does not accept there.
+var ErrNewsletterStatusMediaType = errors.New("channel status only takes text, image or video")

@@ -194,6 +194,14 @@ type SendRequestExtra struct {
 	Timeout time.Duration
 	// When sending media to newsletters, the Handle field returned by the file upload.
 	MediaHandle string
+	// NewsletterStatus posts to a channel's status instead of its feed: the same plaintext
+	// stanza under a <status> root, the way WhatsApp Web's WAWebNewsletterSendStatusJob does
+	// (captured 2026-11-20). Text, image and video only. A revoke built with BuildRevoke and
+	// this flag deletes a channel status. The channel must have the CHANNEL_STATUS_PRODUCER
+	// capability (GetNewsletterAdminCapabilities): a post to a channel without it was never
+	// answered, so callers must check first rather than wait for an error. Ignored for every
+	// destination other than a newsletter.
+	NewsletterStatus bool
 
 	Meta *types.MsgMetaInfo
 	// use this only if you know what you are doing
@@ -540,7 +548,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			phash, data, err = cli.sendDM(ctx, ownID, to, req.ID, message, &resp.DebugTimings, extraParams)
 		}
 	case types.NewsletterServer:
-		data, err = cli.sendNewsletter(ctx, to, req.ID, message, req.MediaHandle, &resp.DebugTimings)
+		data, err = cli.sendNewsletter(ctx, to, req.ID, message, req.MediaHandle, req.NewsletterStatus, &resp.DebugTimings)
 	default:
 		err = fmt.Errorf("%w %s", ErrUnknownServer, to.Server)
 	}
@@ -860,8 +868,34 @@ func (cli *Client) sendNewsletter(
 	id types.MessageID,
 	message *waE2E.Message,
 	mediaID string,
+	asStatus bool,
 	timings *MessageDebugTimings,
 ) ([]byte, error) {
+	start := time.Now()
+	node, err := buildNewsletterNode(to, id, message, mediaID, asStatus)
+	timings.Marshal = time.Since(start)
+	if err != nil {
+		return nil, err
+	}
+	start = time.Now()
+	data, err := cli.sendNodeAndGetData(ctx, node)
+	timings.Send = time.Since(start)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send message node: %w", err)
+	}
+	return data, nil
+}
+
+// buildNewsletterNode builds the plaintext stanza for a channel post, or for a channel
+// status when asStatus is set (root tag <status> instead of <message>; WhatsApp only
+// accepts text, image and video there, see WAWebNewsletterSendStatusJob).
+func buildNewsletterNode(
+	to types.JID,
+	id types.MessageID,
+	message *waE2E.Message,
+	mediaID string,
+	asStatus bool,
+) (waBinary.Node, error) {
 	attrs := waBinary.Attrs{
 		"to":   to,
 		"id":   id,
@@ -877,11 +911,9 @@ func (cli *Client) sendNewsletter(
 		attrs["edit"] = string(types.EditAttributeAdminRevoke)
 		message = nil
 	}
-	start := time.Now()
 	plaintext, _, err := marshalMessage(to, message)
-	timings.Marshal = time.Since(start)
 	if err != nil {
-		return nil, err
+		return waBinary.Node{}, err
 	}
 	plaintextNode := waBinary.Node{
 		Tag:     "plaintext",
@@ -889,22 +921,27 @@ func (cli *Client) sendNewsletter(
 		Attrs:   waBinary.Attrs{},
 	}
 	if message != nil {
-		if mediaType := getMediaTypeFromMessage(message); mediaType != "" {
+		mediaType := getMediaTypeFromMessage(message)
+		if asStatus {
+			switch mediaType {
+			case "", "image", "video":
+			default:
+				return waBinary.Node{}, fmt.Errorf("%w: %s", ErrNewsletterStatusMediaType, mediaType)
+			}
+		}
+		if mediaType != "" {
 			plaintextNode.Attrs["mediatype"] = mediaType
 		}
 	}
-	node := waBinary.Node{
-		Tag:     "message",
+	tag := "message"
+	if asStatus {
+		tag = "status"
+	}
+	return waBinary.Node{
+		Tag:     tag,
 		Attrs:   attrs,
 		Content: []waBinary.Node{plaintextNode},
-	}
-	start = time.Now()
-	data, err := cli.sendNodeAndGetData(ctx, node)
-	timings.Send = time.Since(start)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send message node: %w", err)
-	}
-	return data, nil
+	}, nil
 }
 
 // groupStatusMetaNode marks a group send as a group status: <meta is_group_status="true">,
